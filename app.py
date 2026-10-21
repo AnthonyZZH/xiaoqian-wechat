@@ -3,6 +3,7 @@ import argparse
 import ctypes
 import json
 import queue
+import re
 import sys
 import threading
 import time
@@ -13,14 +14,21 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "vendor"))
 
+from agents import DEFAULT_ROUTES, AgentJobs, default_configs, parse_command
 from brain import Brain
 from lmstudio import LMStudio
 from personas import TEMPLATE, Persona, PersonaStore
 from settings import DATA, Settings
 from stickers import StickerLibrary
+from routing import ChatQueue, preview_text
 
 FONT = "Microsoft YaHei UI"
+AGENT_NAMES = {"claude": "Claude", "codex": "Codex", "deepseek": "DeepSeek"}
+AGENT_ALIASES = {key[1:].casefold(): agent for key, agent in DEFAULT_ROUTES.items()}  # "停掉codex"
+JOB_STATES = {"running": "进行中", "done": "做完了", "failed": "失败了", "timeout": "超时被停掉了",
+              "stopped": "已经停掉了"}
 
 
 class Enabled:
@@ -49,7 +57,7 @@ class Bot:
         self.settings, self.personas, self.log_dir = settings, personas, Path(log_dir)
         self.data = Path(data_dir)  # tests point this at a temp folder, never at real chats
         self.stickers = StickerLibrary(self.data / "stickers")
-        self.brain = Brain(settings, personas, self.stickers)
+        self.brain = Brain(settings, personas, self.stickers, log_path=self.log_dir / "model_calls.jsonl")
         self.lm = LMStudio(settings["lms_path"])
         self.enabled, self.stop = Enabled(), threading.Event()
         self.events, self.commands = queue.Queue(), queue.Queue()
@@ -59,8 +67,16 @@ class Bot:
         self.runners = {}    # chat -> Runner, kept while switching so each chat keeps its place
         self.relays = []     # (chat, text) the owner asked her to say
         self.previews = {}   # chat -> last seen session-list preview, to notice news elsewhere
+        self.incoming = ChatQueue()
+        self.route_retry = {}
         self.since = 0.0     # when the current chat was opened
         self.scanning = None  # background sticker-labelling thread
+        # Agent jobs finish on their own threads and only drop into `finished`;
+        # the worker turns them into one-line `reports` for the owner's private chat.
+        self.finished = queue.Queue()
+        self.reports = []
+        self.report_retry_at = 0.0
+        self.agents = AgentJobs(default_configs(), self.data / "agent_logs", self.finished.put)
 
     def emit(self, kind, payload):
         self.events.put((kind, payload))
@@ -85,80 +101,271 @@ class Bot:
         self.activate(chat, reply_latest=self.reply_latest)
         self.reply_latest = False
 
-    def runner_for(self, chat, reply_latest=False):
+    def runner_for(self, chat, reply_latest=False, outbound_mode=None):
         from runner import Runner
         if chat not in self.runners:
             runner = Runner(self.settings, self.adapter, self.enabled, self.stop, self.emit,
                             self.brain, chat, reply_latest=reply_latest, stickers=self.stickers,
-                            history_dir=self.data / "history", memory_dir=self.data / "memory")
+                            history_dir=self.data / "history", memory_dir=self.data / "memory",
+                            outbound_mode=outbound_mode)
             groups = lambda: [c for c, i in self.settings["chats"].items() if i["mode"] == "group"]
             # Relays need the multi-chat scheduler to carry them out.
-            runner.relay_targets = lambda: groups() if self.settings["multi_chat"] else []
+            runner.relay_targets = lambda: [c for c in self.settings["chats"] if c != self.settings["owner"]]
+            runner.should_yield = lambda r=runner: self.higher_priority(r)
+            runner.agent_command = self.agent_command
             runner.context = lambda: "\n".join(
                 r.digest() for c, r in self.runners.items() if c in groups() and r.digest())
             self.runners[chat] = runner
         return self.runners[chat]
 
-    def activate(self, chat, reply_latest=False):
+    def activate(self, chat, reply_latest=False, outbound_mode=None):
         """Point the adapter and the active runner at `chat` (already open in WeChat)."""
         from personas import safe_name
         from senders import SenderBook
-        mode = self.settings.chat_mode(chat)
+        mode = self.settings.chat_mode(chat) or outbound_mode
         info = self.settings["chats"].get(chat, {})
         book = SenderBook(self.data / "senders" / f"{safe_name(chat)}.json", info.get("roster")) \
             if mode == "group" else None
         self.adapter.set_target(chat, mode, book, self.settings.get("group_layout"))
-        self.runner = self.runner_for(chat, reply_latest)
+        self.runner = self.runner_for(chat, reply_latest, outbound_mode)
         self.since = time.monotonic()
-        if self.settings["chat"] != chat:
+        if chat in self.settings["chats"] and self.settings["chat"] != chat:
             self.settings.update(chat=chat)
             self.emit("chats", None)
 
-    def go(self, chat, reply_latest=False):
-        if self.runner:
-            # Her own last message here changed the preview; that is not news to come back for.
-            self.previews[self.runner.chat] = self.adapter.session_states().get(self.runner.chat)
+    def go(self, chat, reply_latest=False, outbound=False):
+        previous_runner = self.runner
+        if previous_runner and previous_runner.chat != chat and previous_runner.pending:
+            previous_runner.suspended_at = getattr(previous_runner, "suspended_at", None) or time.monotonic()
         self.adapter.open_chat(chat)
-        self.activate(chat, reply_latest)
+        title, single = self.adapter.current()
+        if title != chat:
+            raise RuntimeError(f"没能核对收件人「{chat}」，不会向当前聊天发送")
+        mode = "private" if single else "group"
+        if chat not in self.settings["chats"] and not outbound:
+            raise RuntimeError(f"「{chat}」未加入监听列表")
+        if chat in self.settings["chats"] and self.settings.chat_mode(chat) != mode:
+            raise RuntimeError(f"「{chat}」的聊天类型不符，请在控制台更新")
+        self.activate(chat, reply_latest, outbound_mode=mode if outbound else None)
+        suspended = getattr(self.runner, "suspended_at", None)
+        if suspended is not None:
+            self.runner.last_incoming += time.monotonic() - suspended
+            self.runner.suspended_at = None
+
+    def observe_chats(self):
+        states = self.adapter.session_details() if hasattr(self.adapter, "session_details") else self.adapter.session_states()
+        self.incoming.observe(states, self.settings["chats"])
+        self.previews = self.incoming.observed
+        return states
+
+    def higher_priority(self, runner):
+        if not self.settings["multi_chat"]:
+            return False
+        self.observe_chats()
+        chats, owner = self.settings["chats"], self.settings["owner"]
+        next_chat = self.incoming.next(chats, owner, self.runners)
+        return next_chat is not None and self.incoming.priority(next_chat, chats, owner, self.runners.get(next_chat)) \
+            < self.incoming.priority(runner.chat, chats, owner, runner)
+
+    def send_relay(self, chat, text, why="主人让我说的", limit=None):
+        """One exact recipient, no model call in the destination, no fallback chat."""
+        source = self.runner.chat
+        try:
+            self.go(chat, outbound=True)
+            self.runner.say(text, why, limit)
+            self.emit("status", f"已向「{chat}」转告" if limit is None else f"已在「{chat}」发出{why}")
+        finally:
+            # Reading or model inference in the recipient chat must not accidentally
+            # send an unrelated reply or leave later owner work in the wrong chat.
+            try:
+                self.go(source)
+            except Exception:
+                self.enabled.clear()
+                self.emit("error", "无法返回原聊天，已暂停；不会向其他聊天继续发送")
 
     def watch(self):
-        """Multi-chat mode: follow manual switches, carry out relays, visit chats with news.
-
-        Leaves a chat only when nothing there is waiting for a reply, and after a
-        short dwell so a lively chat is not abandoned mid-conversation.
-        """
+        """Preserve every changed session; owner, then private chats, then groups."""
         chats = self.settings["chats"]
         title, _ = self.adapter.current()
         if title in chats and title != self.runner.chat:
             self.activate(title)
-        relay = self.runner.take_relay()
-        if relay:
+        while (relay := self.runner.take_relay()):
             self.relays.append(relay)
-        if not self.previews:
-            # Baseline right away, so news arriving during the first dwell is not absorbed.
-            self.previews = dict(self.adapter.session_states())
-        if self.runner.pending:
-            return
-        if self.relays:
-            chat, text = self.relays.pop(0)
-            self.emit("status", f"去「{chat}」转告：{text}")
-            self.go(chat)
-            self.runner.step()  # read the group first so her line lands in context
-            self.runner.say(text)
-            return
-        if time.monotonic() - self.since < 8:
-            return
-        states = self.adapter.session_states()
-        self.previews[self.runner.chat] = states.get(self.runner.chat)
-        news = [c for c in chats if c != self.runner.chat and c in states
-                and states[c] != self.previews.get(c)]
-        if not news:
-            return
+        states = self.observe_chats()
+        current, runner = self.runner.chat, self.runner
+        job = self.incoming.waiting.get(current)
+        if job and job.get("active") and runner.initialized and not runner.pending:
+            state = states.get(current)
+            if state == job.get("active_snapshot") or runner.own_echo(preview_text(state, current)):
+                self.incoming.waiting.pop(current, None)
         owner = self.settings["owner"]
-        chat = owner if owner in news else news[0]
-        self.previews[chat] = states[chat]
-        self.emit("status", f"「{chat}」有新消息，切过去看看")
-        self.go(chat, reply_latest=chat not in self.runners)
+        excluded = [c for c, at in self.route_retry.items() if time.monotonic() < at]
+        chat = self.incoming.next(chats, owner, self.runners, excluded)
+        priority = lambda c: self.incoming.priority(c, chats, owner, self.runners.get(c))
+        if runner.pending and (chat is None or priority(chat) >= priority(current)):
+            if job:
+                job.update(active=True, active_snapshot=states.get(current))
+            return
+        # Agent reports: in the owner's chat step() sends them; with multi-chat go
+        # there; a single-chat bot elsewhere keeps them until the owner's chat is back.
+        owner_runner = self.runners.get(owner)
+        if current != owner and owner_runner and owner_runner.notices:
+            self.reports[0:0] = list(owner_runner.notices)
+            owner_runner.notices.clear()
+        if current == owner:
+            if self.reports:
+                runner.notices.extend(self.reports)
+                self.reports.clear()
+                self.report_retry_at = 0.0
+            if runner.notices:
+                return
+        elif self.reports and self.settings["multi_chat"] \
+                and time.monotonic() >= self.report_retry_at \
+                and (chat is None or priority(chat) > 0):
+            from runner import NOTICE_CHARS
+            from wechat_adapter import SendUncertain
+            text = self.reports[0]
+            try:
+                self.send_relay(owner, text, "任务汇报", NOTICE_CHARS)
+            except (SendUncertain, ValueError) as exc:
+                self.reports.pop(0)
+                self.report_retry_at = 0.0
+                self.emit("error", f"任务汇报没发出去且不会重试：{exc}")
+            except Exception as exc:
+                self.report_retry_at = time.monotonic() + 10
+                self.emit("error", f"任务汇报没发出去：{exc}")
+            else:
+                self.reports.pop(0)
+                self.report_retry_at = 0.0
+            return
+        if self.relays and (chat is None or priority(chat) > 0):
+            target, text = self.relays.pop(0)
+            try:
+                self.send_relay(target, text)
+            except Exception as exc:
+                self.emit("error", f"向「{target}」转告失败：{exc}；没有改发到其他聊天")
+            return
+        if not self.settings["multi_chat"] or chat is None:
+            if current in excluded and not runner.initialized:
+                return False
+            return
+        job = self.incoming.waiting[chat]
+        try:
+            if chat != current:
+                self.go(chat)
+            if not self.runner.initialized or self.runner.active_epoch != self.enabled.epoch:
+                latest = job["latest"]
+                unread = latest.get("unread", 0) if isinstance(latest, dict) else 0
+                self.runner.prime(self.adapter.read(), job["baseline"], unread, replay=job.get("replay", False))
+            job.update(active=True, active_snapshot=states.get(chat))
+            self.runner.status(f"处理「{chat}」 · 待处理聊天 {len(self.incoming.waiting)} 个")
+        except Exception as exc:
+            self.route_retry[chat] = time.monotonic() + 10
+            self.emit("error", f"「{chat}」待办已保留：{exc}")
+            return False
+
+    def cycle(self):
+        if self.watch() is False:
+            return
+        self.runner.step()
+        self.watch()
+
+    # ---- local agents, commanded from the owner's private chat ----
+    def agent_command(self, text, act=True):
+        """None for ordinary chat; else {"log": passphrase-free text, "reply": receipt}.
+
+        With act=False (messages from a pause) nothing is started or stopped.
+        """
+        if not self.settings["agents_enabled"]:
+            return None
+        line = " ".join(str(text).split())
+        if line.rstrip("?？。!！") in ("任务", "任务列表"):
+            return {"log": line, "reply": self.job_list() if act else None}
+        match = re.fullmatch(r"(?:停掉|停止|停下)\s*[:：,，]?\s*([^\s的]+)(?:\s*的?任务)?", line)
+        agent = AGENT_ALIASES.get(match.group(1).casefold()) if match else None
+        if agent:
+            return {"log": line, "reply": self.stop_agent(agent) if act else None}
+        parsed = parse_command(text, DEFAULT_ROUTES, self.settings["agent_passphrase"])
+        if not parsed:
+            return None
+        agent, task = parsed
+        return {"log": f"给{agent} {' '.join(task.split())}", "reply": self.dispatch(agent, task) if act else None}
+
+    def agent_configs(self):
+        configs = default_configs()
+        for name, extra in (self.settings.get("agent_overrides") or {}).items():
+            if name in configs and isinstance(extra, dict):
+                configs[name].update(extra)
+        return configs
+
+    @staticmethod
+    def job_label(job):
+        task = " ".join(job.task.split())
+        return f"{AGENT_NAMES.get(job.agent, job.agent)}「{task[:20] + '…' if len(task) > 20 else task}」"
+
+    def dispatch(self, agent, task):
+        name = AGENT_NAMES.get(agent, agent)
+        if any(j.agent == agent and j.status == "running" for j in self.agents.jobs()):
+            return f"{name} 手上还有任务没做完，这个没派出去。发“任务”看进度，要换就先说“停掉{agent}”"
+        self.agents.configs = self.agent_configs()  # overrides apply from the next task on
+        try:
+            self.agents.start(agent, task)
+        except Exception as exc:
+            return f"没派出去：{exc}"
+        self.emit("status", f"已派给 {name}：{' '.join(task.split())[:60]}")
+        return f"收到，交给 {name} 了，做完告诉你"
+
+    def job_list(self):
+        from runner import NOTICE_CHARS
+        jobs = self.agents.jobs()
+        running, recent = [], []
+        for job in jobs:
+            status = job.status
+            if status == "running":
+                running.append(job)
+            elif len(recent) < 3:
+                recent.append((job, status, job.finished or time.time()))
+        if not jobs:
+            return "现在没有任务，最近也没有做完的"
+        parts = [f"{self.job_label(j)}进行中，已 {int((time.time() - j.started) // 60)} 分钟" for j in running]
+        parts += [f"{self.job_label(j)}{JOB_STATES.get(status, status)}（{datetime.fromtimestamp(finished):%H:%M}）"
+                  for j, status, finished in recent]
+        return "；".join(parts)[:NOTICE_CHARS]
+
+    def stop_agent(self, agent):
+        name = AGENT_NAMES.get(agent, agent)
+        running = [j for j in self.agents.jobs() if j.agent == agent and j.status == "running"]
+        if not running:
+            return f"{name} 现在没有在跑的任务"
+        stopped = sum(bool(self.agents.stop(job.id)) for job in running)
+        if not stopped:
+            return f"{name} 刚好已经结束了，汇报马上到"
+        return f"好，让 {name} 停下了"
+
+    def report(self, job):
+        """One line for the owner: the local model's summary, else status plus the last lines."""
+        from runner import NOTICE_CHARS
+        head = self.job_label(job) + JOB_STATES.get(job.status, job.status)
+        if job.status == "stopped":
+            return head
+        try:
+            if not job.tail.strip():
+                raise ValueError("没有输出")
+            body = self.brain.summarize_job(job)
+        except Exception:
+            lines = [line.strip() for line in job.tail.splitlines() if line.strip()][-4:]
+            body = f"退出码 {job.returncode}，最后几行：{' / '.join(lines)[-300:]}" if lines else \
+                f"退出码 {job.returncode}，没有输出"
+        return " ".join(f"{head}：{body} （日志 {job.log_path.name}）".split())[:NOTICE_CHARS]
+
+    def collect_reports(self):
+        while True:
+            try:
+                job = self.finished.get_nowait()
+            except queue.Empty:
+                return
+            self.reports.append(self.report(job))
+            self.emit("status", f"{self.job_label(job)}{JOB_STATES.get(job.status, job.status)}，汇报会发到主人私聊")
 
     def ensure_model(self):
         model = self.settings["model"]
@@ -177,7 +384,19 @@ class Bot:
             self.adapter.validate()
             self.ensure_model()
             if not self.stop.is_set() and self.enabled.epoch == ticket:
+                rows = self.adapter.read()
+                if self.runner.initialized:
+                    self.runner.ingest(rows, replay=True)  # context only, no agent commands
+                    self.runner.pending.clear()
+                else:
+                    self.runner.prime(rows)
+                self.incoming = ChatQueue()
+                self.route_retry.clear()
+                self.observe_chats()
+                for waiting in self.incoming.waiting.values():
+                    waiting["replay"] = True  # unread from the pause: no agent commands
                 self.enabled.set()
+                self.runner.active_epoch = self.enabled.epoch
         elif name == "switch":
             chat, allow = args[1], args[2]
             self.enabled.clear()
@@ -287,11 +506,13 @@ class Bot:
                     except Exception as exc:
                         self.emit("error", str(exc))
                     self.adapter.max_chars = self.settings["max_reply_chars"]
+                    try:
+                        self.collect_reports()
+                    except Exception as exc:
+                        self.emit("error", f"整理任务汇报出错：{exc}")
                     if self.enabled.is_set():
                         try:
-                            self.runner.step()
-                            if self.settings["multi_chat"]:
-                                self.watch()
+                            self.cycle()
                         except Exception as exc:
                             self.runner.status(str(exc))
                     else:
@@ -448,7 +669,23 @@ class App:
         ttk.Button(owner, text="保存", command=lambda: (self.settings.update(owner=self.owner.get().strip()),
                                                        self.status.set(f"主人设为「{self.owner.get().strip()}」"))
                    ).pack(side="left", padx=6)
+        agent = ttk.Frame(frame)
+        agent.pack(fill="x", pady=(8, 0))
+        ttk.Label(agent, text="派任务口令（主人私聊发“给claude 口令 任务”，留空则不需要）：").pack(side="left")
+        self.passphrase = ttk.Entry(agent, width=14, show="*")
+        self.passphrase.insert(0, self.settings["agent_passphrase"])
+        self.passphrase.pack(side="left")
+        self.agents_on = tk.BooleanVar(value=self.settings["agents_enabled"])
+        ttk.Checkbutton(agent, text="允许派任务", variable=self.agents_on).pack(side="left", padx=6)
+        ttk.Button(agent, text="保存", command=self.save_agents).pack(side="left")
         self.fill_chats()
+
+    def save_agents(self):
+        phrase = self.passphrase.get().strip()
+        self.settings.update(agent_passphrase=phrase, agents_enabled=self.agents_on.get())
+        # Never echo the passphrase into the status line or the log.
+        self.status.set(("已保存派任务口令" if phrase else "已清空口令：派任务不需要口令")
+                        if self.agents_on.get() else "已关闭派任务：这类消息当普通聊天")
 
     def save_aliases(self):
         import re

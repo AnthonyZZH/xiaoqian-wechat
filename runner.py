@@ -23,8 +23,10 @@ def dangling(text):
 from personas import safe_name
 from senders import avatar_hash, distance
 from settings import DATA, ROOT
+from routing import preview_text, recipients
 
 NEVER = float("inf")
+NOTICE_CHARS = 500  # agent receipts and reports may be longer than a chat reply, never multi-line
 IMAGE_CACHE = []  # (fingerprint, description), shared by every chat in this process
 
 
@@ -57,7 +59,7 @@ def load_history(path: Path, chat: str):
 class Runner:
     def __init__(self, settings, adapter, enabled, stop, emit, brain, chat,
                  history_dir: Path = DATA / "history", reply_latest=False, stickers=None,
-                 memory_dir: Path = DATA / "memory"):
+                 memory_dir: Path = DATA / "memory", outbound_mode=None):
         self.stickers = stickers
         self.memory = Memory(Path(memory_dir) / f"{safe_name(chat)}.json")
         self.unlearned, self.learn_failed_at = 0, -NEVER
@@ -68,7 +70,15 @@ class Runner:
         self.relay_targets = lambda: []
         self.context = lambda: ""
         self.relay = None
-        self.mode = settings.chat_mode(chat)
+        self.relay_queue = deque()
+        self.should_yield = lambda: False
+        # Owner commands for local agents, wired up by the scheduler: (text, act) ->
+        # None when it is ordinary chat, else {"log": text without the passphrase,
+        # "reply": receipt or None}. Receipts and reports wait in `notices`.
+        self.agent_command = lambda text, act=True: None
+        self.notices = deque()
+        self.replaying = False  # set by ingest(replay=True): pause-time messages are never acted on
+        self.mode = settings.chat_mode(chat) or outbound_mode
         if self.mode not in ("private", "group"):
             raise ValueError(f"「{chat}」不在允许的聊天列表里")
         self.config, self.adapter, self.brain, self.chat = settings, adapter, brain, chat
@@ -197,6 +207,15 @@ class Runner:
     def accept(self, row):
         if row.role != "user" or self.own_echo(row.text):
             return False
+        if self.is_owner() and getattr(row, "image", None) is None:
+            handled = self.agent_command(row.text, act=not self.replaying)
+            if handled:
+                # Never a model turn; only the passphrase-free form reaches history and logs.
+                self.history.append({"role": "user", "text": handled["log"]})
+                self.emit("received", handled["log"])
+                if handled.get("reply"):
+                    self.notices.append(handled["reply"])
+                return True
         if getattr(row, "image", None) is not None:
             if self.own_sticker(row.image):
                 return False
@@ -215,10 +234,15 @@ class Runner:
         self.emit("received", f"{sender}：{row.text}" if entry.get("sender") else row.text)
         return True
 
-    def ingest(self, rows):
+    def ingest(self, rows, replay=False):
+        """replay: rows from a pause, kept as context; agent commands in them are not run."""
         changed = False
-        for row in self.fresh(rows):
-            changed = self.accept(row) or changed
+        self.replaying = replay
+        try:
+            for row in self.fresh(rows):
+                changed = self.accept(row) or changed
+        finally:
+            self.replaying = False
         if changed:
             self.save()
         return changed
@@ -283,16 +307,62 @@ class Runner:
         return self.mode == "private" and self.chat == self.config.get("owner", "")
 
     def take_relay(self):
+        if self.relay_queue:
+            return self.relay_queue.popleft()
         relay, self.relay = self.relay, None
         return relay
 
-    def say(self, text, why="主人让我说的"):
-        """Send `text` in this chat without asking the model (owner relay).
+    def prime(self, rows, baseline=None, unread=0, replay=False):
+        """Establish a first-visit anchor and queue every identifiable new row.
+
+        replay: the rows were waiting from before “start”; agent commands in them are not run.
+        """
+        if self.initialized and self.active_epoch != self.enabled.epoch:
+            self.initialized = False
+            self.pending.clear()
+        if self.initialized:
+            self.ingest(rows, replay=replay)
+            return
+        start = len(rows)
+        replay_latest = False
+        if unread:
+            users = [i for i, row in enumerate(rows) if row.role == "user"]
+            if len(users) < unread:
+                raise RuntimeError("未读消息超出当前可见范围，请打开聊天加载完整消息后再继续")
+            start = users[-unread]
+        elif baseline:
+            prior = compact(preview_text(baseline, self.chat))
+            matches = [i for i, row in enumerate(rows) if compact(row.text) == prior
+                       or (getattr(row, "sender", "") and prior in (
+                           compact(row.sender + "：" + row.text), compact(row.sender + ":" + row.text)))]
+            if matches:
+                start = matches[-1] + 1
+            else:
+                raise RuntimeError("找不到上次消息的位置，保留待办；请打开聊天加载完整记录后再继续")
+        elif self.reply_latest and rows and rows[-1].role == "user":
+            start = len(rows) - 1
+            replay_latest = True
+        for row in rows:
+            self.mark(row)
+        self.tail = [signature(row) for row in rows][-40:]
+        self.initialized = True
+        self.active_epoch = self.enabled.epoch
+        self.replaying = replay or replay_latest
+        try:
+            changed = [self.accept(row) for row in rows[start:]]
+        finally:
+            self.replaying = False
+        if any(changed):
+            self.save()
+
+    def say(self, text, why="主人让我说的", limit=None):
+        """Send `text` in this chat without asking the model (owner relay, agent notices).
 
         Same rules as any send: only while running, never retried, pause on doubt.
+        `limit` raises the length cap for agent notices only.
         """
         text = " ".join(str(text).split())
-        if not text or len(text) > self.config["max_reply_chars"]:
+        if not text or len(text) > (limit or self.config["max_reply_chars"]):
             raise ValueError("要转告的话为空或太长")
         if not self.enabled.is_set() or self.stop.is_set():
             raise RuntimeError("已暂停，没有转告")
@@ -303,13 +373,30 @@ class Runner:
 
         self.recent_sends.append((time.monotonic(), compact(text)))
         try:
-            self.adapter.send(text, cancel=cancel)
+            self.adapter.send(text, cancel=cancel, **({"max_chars": limit} if limit else {}))
         except Exception:
             self.enabled.clear()
             self.emit("error", "转告发送未确认，已暂停。请检查微信，避免重复。")
             raise
         self.sent(text, proactive=True)
         self.status(f"已在「{self.chat}」说了（{why}）")
+
+    def deliver(self):
+        """Send notices oldest first; retry only failures known to occur before the click."""
+        from wechat_adapter import SendUncertain
+
+        while self.notices and self.is_owner():
+            try:
+                self.say(self.notices[0], "任务回执", limit=NOTICE_CHARS)
+            except (SendUncertain, ValueError):
+                self.notices.popleft()
+                raise
+            else:
+                self.notices.popleft()
+        try:
+            self.ingest(self.adapter.read())
+        except Exception:
+            pass
 
     def digest(self, rows=10):
         """Recent lines of this chat, for the owner's private chat."""
@@ -332,7 +419,7 @@ class Runner:
     def resume(self, rows):
         """After any pause, messages from the pause go to context only, never answered late."""
         self.active_epoch = self.enabled.epoch
-        self.ingest(rows)
+        self.ingest(rows, replay=True)
         self.pending.clear()
         self.proactive_used = True
         self.next_proactive = NEVER
@@ -390,14 +477,23 @@ class Runner:
             self.tail = [signature(r) for r in rows][-40:]
             self.initialized = True
             self.active_epoch = self.enabled.epoch
-            if self.reply_latest and rows and rows[-1].role == "user" and self.accept(rows[-1]):
-                self.save()
+            if self.reply_latest and rows and rows[-1].role == "user":
+                self.replaying = True
+                try:
+                    changed = self.accept(rows[-1])
+                finally:
+                    self.replaying = False
+                if changed:
+                    self.save()
             self.status(f"监听中 · {self.chat}")
             return
         if self.enabled.epoch != self.active_epoch:
             self.resume(rows)
             return
         self.ingest(rows)
+        if self.notices:
+            self.deliver()
+            return
         now = time.monotonic()
         if self.expired(now) or now < self.retry_after:
             return
@@ -451,7 +547,10 @@ class Runner:
                 self.history, proactive, chat=self.chat, mode=self.mode, mentioned=mentioned,
                 continuing=continuing,
                 memory=self.memory.prompt_block(self.speakers()) if self.config["memory_enabled"] else "",
-                **({"relay_targets": self.relay_targets(), "context": self.context()} if self.is_owner() else {}))
+                **({"batch": [{"text": m.text, "sender": getattr(m, "sender", "")} for m in self.pending]}
+                   if len(self.pending) > 1 else {}),
+                **({"relay_targets": self.relay_targets(), "context": self.context(),
+                    "relay_messages": [m.text for m in self.pending]} if self.is_owner() else {}))
             speak, text, sticker = self.parse(result)
             if speak and not proactive and not mentioned and isinstance(result, dict) \
                     and result.get("to_me") is False:
@@ -473,10 +572,19 @@ class Runner:
             return
         if pending_keys != [m.key for m in self.pending] or self.expired(time.monotonic()):
             return
+        if self.should_yield():
+            self.status("先处理更高优先级的消息，本轮待办保留")
+            return
+        requested = recipients([m.text for m in self.pending], self.relay_targets(),
+                               [c for c, info in self.config.get("chats", {}).items() if info["mode"] == "group"])
         self.pending.clear()
-        if self.is_owner() and isinstance(result, dict) and result.get("relay"):
-            # Carried out by the scheduler once this chat is done: it has to switch chats.
-            self.relay = result["relay"]
+        if self.is_owner() and isinstance(result, dict):
+            proposed = result.get("relays") or ([result["relay"]] if result.get("relay") else [])
+            for target, body in proposed:
+                if target in requested and body:
+                    self.relay_queue.append((target, body))
+                else:
+                    self.emit("error", "转告目标与主人指定的不一致，已拒绝；不会改发到其他聊天")
         if proactive:
             self.proactive_used = True  # Also stop repeated polling if the LLM chose silence.
         if not speak:

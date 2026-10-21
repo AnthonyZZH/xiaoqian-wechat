@@ -12,10 +12,16 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "vendor"))
 import uiautomation as auto
 from PIL import ImageGrab, ImageOps, ImageStat
 
 from senders import SenderBook, avatar_hash
+
+
+class SendUncertain(RuntimeError):
+    """The send button was clicked, but WeChat did not confirm the outcome."""
+
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _user32.WindowFromPoint.argtypes = [wintypes.POINT]
@@ -132,24 +138,88 @@ class WeChatAdapter:
         return {item.AutomationId[len("session_item_"):]: item.Name for item in listing.GetChildren()
                 if item.AutomationId.startswith("session_item_")}
 
+    def session_details(self):
+        """Preview plus an explicit accessible unread badge, when WeChat exposes one."""
+        self.check_window()
+        listing = self.window.ListControl(AutomationId="session_list")
+        if not listing.Exists(0.3):
+            return {}
+        result = {}
+        for item in listing.GetChildren():
+            if not item.AutomationId.startswith("session_item_"):
+                continue
+            unread = 0
+            for child in descendants(item, 4):
+                name = child.Name or ""
+                match = re.search(r"(?:未读(?:消息)?[：:\s]*(\d+)|(\d+)\s*条未读)", name)
+                if match:
+                    unread = max(unread, int(next(g for g in match.groups() if g)))
+                elif re.search(r"unread|badge", (child.AutomationId or "") + (child.ClassName or ""), re.I) \
+                        and re.fullmatch(r"\d+", name):
+                    unread = max(unread, int(name))
+            result[item.AutomationId[len("session_item_"):]] = {"preview": item.Name, "unread": unread}
+        return result
+
+    def search_chat(self, name):
+        """Search an exact contact/group; reject ambiguous or inaccessible results."""
+        search = self.window.EditControl(Name="搜索", searchDepth=12)
+        if not search.Exists(0.5):
+            raise RuntimeError(f"找不到微信搜索框，请手动打开「{name}」")
+        if self.input_value(search).strip():
+            raise RuntimeError("微信搜索框已有内容，请先清空搜索后再试")
+        search.Click(simulateMove=False, waitTime=0.05)
+        search.GetValuePattern().SetValue(name, waitTime=0)
+        try:
+            deadline = time.monotonic() + 4
+            matches = []
+            while time.monotonic() < deadline:
+                matches = []
+                listing = self.window.ListControl(AutomationId="search_list", searchDepth=14)
+                if listing.Exists(0.2):
+                    for row in listing.GetChildren():
+                        # History hits can have exactly the same name. Only the
+                        # dedicated contact/group result may select a recipient.
+                        if row.ControlTypeName == "ListItemControl" and not row.IsOffscreen \
+                                and row.AutomationId == "search_item_" + name and row.Name == name:
+                            matches.append(row)
+                if matches:
+                    break
+                time.sleep(0.2)
+            if len(matches) != 1:
+                raise RuntimeError(f"「{name}」的精确搜索结果有 {len(matches)} 个，未发送；请手动打开正确聊天")
+            row = matches[0]
+            box = row.BoundingRectangle
+            if foreground() != self.hwnd or not visible_point(self.hwnd, (box.left + box.right)//2, (box.top + box.bottom)//2):
+                raise RuntimeError("搜索结果被遮挡或焦点改变，未选择收件人")
+            row.Click(simulateMove=False, waitTime=0.05)
+        finally:
+            try:
+                if search.Exists(0) and self.input_value(search) == name:
+                    search.GetValuePattern().SetValue("", waitTime=0)
+            except Exception:
+                pass
+
     def open_chat(self, name):
         """Click `name` in the conversation list and confirm the title changed."""
         self.check_window()
         if self.current()[0] == name:
             return
         item = self.window.ListItemControl(AutomationId="session_item_" + name, searchDepth=30)
-        if not item.Exists(0.5):
-            raise RuntimeError(f"会话列表里看不到「{name}」。请先在微信里给它发过消息或置顶，让它出现在列表可见处")
         previous = foreground()
         self.window.SetActive(waitTime=0.1)
-        box = item.BoundingRectangle
-        if not visible_point(self.hwnd, (box.left + box.right) // 2, (box.top + box.bottom) // 2):
-            raise RuntimeError("会话列表被其他窗口遮住，无法切换")
-        item.Click(simulateMove=False, waitTime=0.05)
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and self.current()[0] != name:
-            time.sleep(0.2)
-        self.restore(previous)
+        try:
+            if item.Exists(0.5) and not item.IsOffscreen:
+                box = item.BoundingRectangle
+                if not visible_point(self.hwnd, (box.left + box.right) // 2, (box.top + box.bottom) // 2):
+                    raise RuntimeError("会话列表被其他窗口遮住，无法切换")
+                item.Click(simulateMove=False, waitTime=0.05)
+            else:
+                self.search_chat(name)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and self.current()[0] != name:
+                time.sleep(0.2)
+        finally:
+            self.restore(previous)
         if self.current()[0] != name:
             raise RuntimeError(f"点击后没有切到「{name}」，请手动打开")
 
@@ -375,11 +445,12 @@ class WeChatAdapter:
         button.Click(simulateMove=False, waitTime=0)
         # Do not retry an uncertain send; this avoids duplicate messages.
         if not self.wait_for(lambda: not self.input_value(edit).strip(), 1.5):
-            raise RuntimeError("发送结果不确定，不自动重试；请查看微信")
+            raise SendUncertain("发送结果不确定，不自动重试；请查看微信")
         self.restore(previous)
 
-    def send(self, text: str, cancel=lambda: False):
-        if not text or "\n" in text or len(text) > self.max_chars:
+    def send(self, text: str, cancel=lambda: False, max_chars=None):
+        """`max_chars` raises the limit for one message (agent reports); chat replies keep the default."""
+        if not text or "\n" in text or len(text) > (max_chars or self.max_chars):
             raise RuntimeError("回复内容超出长度限制")
         edit, previous = self.focus_input(cancel)
         edit.GetValuePattern().SetValue(text, waitTime=0)

@@ -468,13 +468,13 @@ class SchedulerTests(Temp):
         self.assertNotIn('context', self.prompts[0])          # group call: no private context
         self.assertIn('momo：小千在吗', self.prompts[1]['context'])
 
-    def test_no_relay_offered_without_multi_chat(self):
+    def test_explicit_relay_available_without_background_multi_chat(self):
         bot, wx = self.make([])
         bot.settings.update(multi_chat=False)
         bot.runner.step()
         wx.post('示例好友', '去群里说句话')
         bot.runner.step()
-        self.assertEqual(self.prompts[-1]['relay_targets'], [])
+        self.assertEqual(self.prompts[-1]['relay_targets'], ['示例群甲'])
 
 
 class StickerDescTests(Temp):

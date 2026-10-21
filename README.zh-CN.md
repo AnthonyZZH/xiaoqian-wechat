@@ -15,6 +15,7 @@
 - **图片与表情**：视觉模型可描述图片，按描述选择表情；收到的表情可先进入待审核列表。
 - **联网搜索**：使用 DuckDuckGo HTML 搜索，失败时回退 Bing。
 - **多聊天调度**：只照看已加入允许列表的聊天，支持指定联系人的私聊与群聊之间的转告。
+- **本机 agent 任务（可选）**：指定联系人的私聊可以把任务交给本机命令行 agent（Claude Code、Codex 或 DeepSeek Harness），可设口令，做完后收到一句话汇报。见 [docs/USAGE.md](docs/USAGE.md)。
 
 ## 运行要求
 
@@ -57,7 +58,7 @@ py -3.11 -m venv .venv
 ## 测试
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_core test_runner test_memory_edit test_websearch -v
+.\.venv\Scripts\python.exe -m unittest test_core test_runner test_memory_edit test_websearch test_routing test_agents test_agent_bridge -v
 ```
 
 默认测试使用临时数据、模拟微信和模拟模型，不向微信发消息。真实搜索测试仅在 `LIVE_SEARCH=1` 时启用；OCR 测试依赖系统语言组件。测试不会替代当前微信版本的人工收发验证。

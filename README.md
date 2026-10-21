@@ -15,6 +15,7 @@ Supports private chats, group chats, editable long-term memory, and stickers. Th
 - **Images and stickers:** vision models can describe images and select stickers by their descriptions. Collected stickers enter a review queue.
 - **Web search:** DuckDuckGo HTML search with Bing as a fallback.
 - **Multiple chats:** monitors only allowlisted conversations and supports relays from a designated contact's private chat to an allowlisted group.
+- **Local agent tasks (optional):** the designated contact's private chat can hand a task to a local command-line agent (Claude Code, Codex or DeepSeek Harness) with an optional passphrase, and gets a one-line report when it finishes. See [docs/USAGE.md](docs/USAGE.md).
 
 ## Requirements
 
@@ -80,7 +81,7 @@ See [Data and Privacy](docs/PRIVACY.md), [Usage Guide](docs/USAGE.md), and [Thir
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_core test_runner test_memory_edit test_websearch -v
+.\.venv\Scripts\python.exe -m unittest test_core test_runner test_memory_edit test_websearch test_routing test_agents test_agent_bridge -v
 ```
 
 Default tests use temporary data, simulated WeChat adapters, and mocked model responses. They do not send WeChat messages. The live search smoke test runs only with `LIVE_SEARCH=1`; OCR tests require the appropriate Windows language component. Automated tests do not replace manual verification against your WeChat version.

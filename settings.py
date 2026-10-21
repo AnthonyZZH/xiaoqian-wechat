@@ -43,6 +43,10 @@ DEFAULTS = {
     "aliases": [],
     "memory_enabled": True,
     "memory_every": 12,  # new messages between memory updates
+    # The owner's private chat can hand tasks to local command-line agents (agents.py).
+    "agents_enabled": True,
+    "agent_passphrase": "",  # empty: no passphrase needed
+    "agent_overrides": {},   # fields over agents.default_configs(), e.g. {"codex": {"model": "…"}}
 }
 
 
