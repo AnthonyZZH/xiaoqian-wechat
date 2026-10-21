@@ -596,10 +596,29 @@ class SenderTests(Temp):
         self.assertIsNone(snap('完全不像', ['示例好友']))
 
 
+class DateLocaleTests(unittest.TestCase):
+    def test_date_format_does_not_pass_chinese_to_windows_strftime(self):
+        from brain import now_line
+        class Timestamp:
+            year, month, day = 2026, 1, 2
+            def weekday(self):
+                return 4
+            def tzname(self):
+                return 'UTC'
+            def __format__(self, spec):
+                if not spec.isascii():
+                    raise UnicodeEncodeError('ascii', spec, 0, len(spec), 'unsupported locale')
+                return '03:04'
+        with mock.patch('brain.datetime') as clock:
+            clock.now.return_value.astimezone.return_value = Timestamp()
+            self.assertEqual(now_line(), '现在是本机时间 2026年01月02日 星期五 03:04（UTC）。')
+
+
 class OcrTests(unittest.TestCase):
     def test_reads_a_rendered_nickname(self):
         try:
-            from ocr import read_text
+            from ocr import engine, read_text
+            engine()
         except Exception as exc:  # pragma: no cover
             self.skipTest(f'Windows OCR unavailable: {exc}')
         img = Image.new('RGB', (300, 40), (255, 255, 255))

@@ -95,7 +95,8 @@ def extras(catalog, search: bool) -> str:
 def now_line() -> str:
     """The model has no clock; without this it guesses seasons and weekdays wrong."""
     now = datetime.now().astimezone()
-    return f"现在是本机时间 {now:%Y年%m月%d日} 星期{'一二三四五六日'[now.weekday()]} {now:%H:%M}（{now.tzname()}）。"
+    return (f"现在是本机时间 {now.year:04d}年{now.month:02d}月{now.day:02d}日 "
+            f"星期{'一二三四五六日'[now.weekday()]} {now:%H:%M}（{now.tzname()}）。")
 
 
 def situation(mode: str, proactive: bool, mentioned: bool, continuing: bool = False) -> str:
