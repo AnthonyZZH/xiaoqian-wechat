@@ -1,30 +1,34 @@
-# 小千 · AI 微信群友
+# Xiaoqian · AI WeChat Companion
 
-一个在 Windows 上运行的微信聊天搭子。通过桌面微信界面读取和发送消息，使用 LM Studio 中的本地模型判断何时接话，再以设定的人格回复。
+English | [简体中文](README.zh-CN.md)
 
-支持私聊、群聊和长期记忆。默认打开控制台后保持暂停，由使用者选择聊天并开始。项目仍处于试验阶段，微信版本、窗口布局和显示缩放都可能影响识别。
+A Windows desktop companion for WeChat, powered by local models through LM Studio. It reads and sends messages through the WeChat interface, decides when to join a conversation, and replies using a configurable persona.
 
-## 功能
+Supports private chats, group chats, editable long-term memory, and stickers. The control panel starts **paused**: choose a chat and start it yourself. This is an experimental project; WeChat updates, window layout, and display scaling can affect recognition.
 
-- **参与对话**：合并短时间内的连续消息，判断是否在对机器人说话；群聊中按点名、上下文和频率决定是否插话。
-- **主动接话**：私聊在一段时间后可延续话题；群聊主要响应新消息，不会定时主动开话题。
-- **可编辑人格**：内置“小千”和“阿温”，支持新增、修改人格。
-- **长期记忆**：按聊天整理人物档案、黑话和聊天风格；可以手动编辑，保存前备份，遇到并发更新时提示冲突。
-- **图片与表情**：视觉模型可描述图片，按描述选择表情；收到的表情可先进入待审核列表。
-- **联网搜索**：使用 DuckDuckGo HTML 搜索，失败时回退 Bing。
-- **多聊天调度**：只照看已加入允许列表的聊天，支持指定联系人的私聊与群聊之间的转告。
+## Features
 
-## 运行要求
+- **Conversational participation:** batches consecutive messages and checks whether a reply is appropriate. Group participation considers mentions, recent context, and speaking frequency.
+- **Follow-up messages:** can continue private conversations after a delay. Group participation responds to incoming messages rather than opening topics on a timer.
+- **Editable personas:** includes Xiaoqian, a cheerful and mildly sarcastic companion, and Awen, a gentler persona. Create and edit your own in the control panel.
+- **Long-term memory:** stores people, group slang, and conversation style separately for each chat. Manual edits include backups and conflict detection.
+- **Images and stickers:** vision models can describe images and select stickers by their descriptions. Collected stickers enter a review queue.
+- **Web search:** DuckDuckGo HTML search with Bing as a fallback.
+- **Multiple chats:** monitors only allowlisted conversations and supports relays from a designated contact's private chat to an allowlisted group.
 
-- Windows 10 / 11，64 位 Python 3.11，安装时包含 Tkinter。
-- 已登录的桌面微信。适配器面向 **微信 4.1.x**，曾在 **4.1.15.13** 环境试用，其他版本需要自行校准。
-- LM Studio、本地模型和 `lms` 命令行工具。文字模型可聊天；图片识别和表情整理需要视觉模型。
-- 群昵称 OCR 使用 Windows 自带的中文 OCR，需要对应语言组件。
-- 足够容纳所选模型的显存；当前加载器请求全部 GPU 卸载。加载成功不代表所有配置下都能完全避免内存压力。
+## Requirements
 
-## 安装与启动
+- Windows 10 or 11, with **64-bit Python 3.11** and Tkinter.
+- A logged-in desktop WeChat client. The adapter targets **WeChat 4.1.x** and has been tried with **4.1.15.13**. Other versions may require calibration.
+- LM Studio, its `lms` CLI, and a downloaded model. Image understanding and sticker labeling require a vision-capable model.
+- The Windows Chinese OCR component for group nickname recognition.
+- Enough GPU memory for your chosen model. The loader requests full GPU offload; this does not guarantee that every configuration avoids system memory pressure.
 
-在项目目录中运行：
+The current interface and built-in prompts are in Chinese. This English README documents installation and operation; it does not add an English interface.
+
+## Installation
+
+Run these commands from the project directory:
 
 ```powershell
 py -3.11 -m venv .venv
@@ -32,53 +36,76 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe app.py
 ```
 
-也可在安装依赖后双击 `启动小千.cmd`。首次运行会在本机创建 `data/`，仓库不附带任何聊天、记忆、表情、账号配置或模型文件。
+After installing dependencies, you can also double-click `启动小千.cmd`. The application creates `data/` locally on first run. The repository includes no chat history, learned memories, personal stickers, account configuration, or model weights.
 
-1. 打开 LM Studio 的本地 API 服务，默认地址为 `http://127.0.0.1:1234/v1`。
-2. 在控制台“模型”页选择已下载的模型。默认模型名称只是示例，请替换为自己安装的模型；`lms` 默认路径按当前 Windows 用户目录生成，需要时可修改 `data/settings.json`。
-3. 在“聊天”页刷新会话，加入并选择需要照看的聊天，删除不使用的示例项。
-4. 设置机器人微信昵称、指定联系人和人格。群聊先进行只读识别校准，再检查昵称是否正确。
-5. 保持微信窗口可见，在“运行”页点击“开始 / 继续”。先用测试私聊验证收发，再启用群聊。
+## First run
 
-窗口被遮挡、最小化或发送结果不确定时，程序会停止本次收发并提示状态；请查看微信后再继续。
+1. Start LM Studio's local API server. The default endpoint is `http://127.0.0.1:1234/v1`.
+2. In **Models** (`模型`), select a model you have downloaded. The default model key is a placeholder. The `lms` path is derived from your Windows user directory; update `data/settings.json` if needed.
+3. In **Chats** (`聊天`), refresh the conversation list, add a test conversation, and select it. Remove unused placeholder entries.
+4. Set the bot's WeChat nickname, designated contact, and persona. For groups, run the read-only recognition calibration and check the detected names first.
+5. Keep WeChat visible and click **Start / Continue** (`开始 / 继续`). Verify behavior in a test private chat before enabling groups.
 
-## 修改记忆与表情
+If the window is obscured or minimized, or a send cannot be confirmed, the application stops that operation and reports its status. Check WeChat before continuing.
 
-- **记忆 → 编辑记忆**：新增、修改或删除人物档案、常用说法，或修改聊天风格；点击“保存修改”后下一次回复生效。
-- 手动保存前的版本位于 `data/memory/backups/`。编辑期间记忆有新更新时，草稿会保留并提示冲突。
-- 记忆会继续随聊天更新，手动修改不等于永久锁定；删除旧事实也不能保证模型今后不会从新聊天重新学到。
-- 把个人表情图片放进 `data/stickers/` 后，在“表情包”页整理和编辑描述。分析大量图片会增加 GPU 负载。
-- 从聊天界面收集的是截图，动图会变成静态图；本项目不包含微信收藏表情数据库的解密导出工具。
+## Editing memory
 
-更多说明见 [使用指南](docs/USAGE.md)、[数据与隐私](docs/PRIVACY.md) 和 [第三方依赖与参考](THIRD_PARTY.md)。
+Open **Memory → Edit Memory** (`记忆 → 编辑记忆`). Add, edit, or remove people and slang entries, or change the chat's conversation style. Click **Save Changes** (`保存修改`); the next reply uses the updated memory.
 
-## 测试
+- Previous versions are backed up under `data/memory/backups/`.
+- If memory changes while you are editing, your draft is kept and a conflict is reported instead of overwriting the newer version.
+- Memory continues to evolve with later conversations. Manual edits do not permanently lock facts; deleted information may be learned again from new messages.
+
+## Images and stickers
+
+Put your own PNG, JPEG, GIF, or WebP files in `data/stickers/`, then organize them in **Stickers** (`表情包`). Review and edit descriptions to explain when each sticker is appropriate. Analyzing many images increases GPU load.
+
+Stickers collected from the chat interface are screenshots, so animated stickers become static images. This project does **not** include a tool for decrypting and exporting WeChat's saved-sticker database.
+
+Sending images temporarily changes the clipboard. The application attempts to restore its previous text; it cannot fully restore a previous image clipboard.
+
+## Data and privacy
+
+Runtime configuration, chat context, memory, screenshots, stickers, logs, and backups are stored locally under `data/`, which is excluded by `.gitignore`.
+
+- Model requests go to the configured API endpoint. The default is local; choosing a remote endpoint sends the supplied conversation, images, and memory to that service.
+- Web search sends queries to DuckDuckGo or Bing. Disable it in **Pacing** (`节奏`) if unwanted.
+- Messages and stickers are sent through WeChat to configured conversations.
+- LM Studio manages its own logging and data retention separately.
+
+Memory filtering is heuristic and cannot guarantee removal of every sensitive detail or incorrect inference. Review learned memories regularly. Clearing current memory does not delete its backups or other logs.
+
+See [Data and Privacy](docs/PRIVACY.md), [Usage Guide](docs/USAGE.md), and [Third-party Dependencies and References](THIRD_PARTY.md). Those detailed documents are currently in Chinese.
+
+## Tests
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest test_core test_runner test_memory_edit test_websearch -v
 ```
 
-默认测试使用临时数据、模拟微信和模拟模型，不向微信发消息。真实搜索测试仅在 `LIVE_SEARCH=1` 时启用；OCR 测试依赖系统语言组件。测试不会替代当前微信版本的人工收发验证。
+Default tests use temporary data, simulated WeChat adapters, and mocked model responses. They do not send WeChat messages. The live search smoke test runs only with `LIVE_SEARCH=1`; OCR tests require the appropriate Windows language component. Automated tests do not replace manual verification against your WeChat version.
 
-## 目录
+## Project layout
 
-| 文件 | 用途 |
+| File | Purpose |
 | --- | --- |
-| `app.py` | 控制台、工作线程与聊天调度 |
-| `runner.py` | 新消息识别、回复节奏与发送控制 |
-| `brain.py` | 模型调用、接话判断、图片描述与记忆整理 |
-| `wechat_adapter.py` | 桌面微信界面适配 |
-| `memory.py` / `memory_editor.py` | 记忆存储、校验与编辑窗口 |
-| `stickers.py` | 表情描述、选择与待审核收集 |
-| `websearch.py` | 标准库搜索模块 |
-| `ocr.py` / `senders.py` | 中文 OCR、昵称校准与头像匹配 |
-| `settings.py` / `personas.py` | 本地设置与人格 |
-| `lmstudio.py` | LM Studio 模型加载与实例管理 |
-| `inspect_group.py` | 群聊识别的只读校准 |
-| `data/` | 运行时个人数据，始终不提交 |
+| `app.py` | Control panel, worker thread, and chat scheduling |
+| `runner.py` | New-message tracking, reply timing, and send control |
+| `brain.py` | Model requests, participation decisions, image descriptions, and memory extraction |
+| `wechat_adapter.py` | Desktop WeChat interface adapter |
+| `memory.py` / `memory_editor.py` | Memory storage, validation, and editing forms |
+| `stickers.py` | Sticker descriptions, selection, and review queue |
+| `websearch.py` | Standard-library search implementation |
+| `ocr.py` / `senders.py` | Chinese OCR, nickname correction, and avatar matching |
+| `settings.py` / `personas.py` | Local settings and personas |
+| `lmstudio.py` | LM Studio model loading and instance management |
+| `inspect_group.py` | Read-only group recognition calibration |
+| `data/` | Personal runtime data; never commit this directory |
 
-## 已知限制
+## Known limitations
 
-这是桌面界面自动化工具，依赖窗口可见及界面结构稳定。群昵称 OCR、消息方向、引用和媒体识别均可能出错。连续快速切换聊天或大量新消息时，程序会优先放弃不确定的回复。搜索页面结构和访问限制可能导致联网失败。模型输出和长期记忆也可能出现误判，应定期检查。
+This application relies on a visible, stable desktop interface. Group nickname OCR, message direction, quoted messages, and media recognition can be wrong. Rapid chat switching or large message bursts may cause uncertain replies to be skipped. Search providers can change their HTML or restrict access. Model responses and learned memories can contain mistakes.
 
-机器人按已配置的聊天权限工作，建议让聊天参与者知晓它是 AI。上传自己的修改前，请检查暂存区，勿提交 `data/`、截图、日志、账号标识或本机配置。
+The model loader switches only the bot's own model instance. The working-set trimming helper can affect other `llama-server` processes on the same machine; it is a memory-management aid, not a guarantee of lower resource usage.
+
+Let conversation participants know they are interacting with an AI. Before publishing your own changes, review staged files and exclude personal data, screenshots, logs, credentials, and machine-specific configuration.
