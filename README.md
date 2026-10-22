@@ -19,7 +19,7 @@ Supports private chats, group chats, editable long-term memory, and stickers. Th
 - **Web search:** DuckDuckGo HTML search with Bing as a fallback.
 - **Multiple chats:** monitors only allowlisted conversations and supports relays from a designated contact's private chat to other allowlisted chats.
 - **Owner sends:** in the designated contact's private chat, "给某某发：…" or "在某群里说：…" sends the text after the colon (whitespace collapsed) to any WeChat chat found by name (short group names are matched only when unambiguous), without the model, and reports back whether it was really sent. @mentions are picked from WeChat's member list like a person would; free wording is read by the local model and then checked.
-- **Drawing:** "画一只橘猫" / "帮我画：…" gets a picture from Codex's image tool, sent back to the chat that asked; asked to follow an online look, fan art or a character, it searches for references first. Drawing rights and daily limits are set separately for each allowed group or private chat; the owner has no limit. The console's 画图 tab shows live job states and manages past pictures.
+- **Drawing:** "画一只橘猫" / "帮我画：…" / "生成一张…" is drawn by a local Stable Diffusion WebUI Forge (A1111 API) and sent back to the chat that asked. The Chinese request becomes Danbooru-style English tags; a character asked for by name ("雪之下雪乃穿比基尼") is looked up on Danbooru first (her tag, series and usual look) and the positive and negative prompts keep her recognisable while the outfit and scene follow the request. The older Codex image-tool mode, which searches the web for references, can still be chosen. Drawing rights and daily limits are set separately for each allowed group or private chat; the owner has no limit. The console's 画图 tab shows live job states and manages past pictures.
 - **Asked means done:** real work the owner mentions in passing (a drawing, research to summarize, a file to make) is handed to the right agent, and she replies with the real receipt instead of promising.
 - **Blocking and memory on command:** "拉黑 X" / "解除拉黑 X" / "黑名单" and "总结记忆", in the private chat or by @-ing her in a group.
 - **Local agent tasks (on by default, can be turned off):** the designated contact's private chat can hand a task to a local command-line agent (Claude Code, Codex or DeepSeek Harness) with an optional passphrase, and gets a one-line report when it finishes. See [docs/USAGE.md](docs/USAGE.md).
@@ -30,6 +30,7 @@ Supports private chats, group chats, editable long-term memory, and stickers. Th
 - A logged-in desktop WeChat client. The adapter targets **WeChat 4.1.x** and has been tried with **4.1.15.13**. Other versions may require calibration.
 - LM Studio, its `lms` CLI, and a downloaded model. Image understanding and sticker labeling require a vision-capable model.
 - RapidOCR (installed from `requirements.txt`) for group nicknames; the Windows Chinese OCR component is the fallback.
+- For drawing: Stable Diffusion WebUI Forge started with `--api` (default `http://127.0.0.1:7860`) and an anime SDXL checkpoint; the defaults suit Illustrious models such as waiIllustriousSDXL. Set `forge_root`, `forge_model` and `draw_params` in `data/settings.json`.
 - Enough GPU memory for your chosen model. The loader requests full GPU offload; this does not guarantee that every configuration avoids system memory pressure.
 
 The current interface and built-in prompts are in Chinese. This English README documents installation and operation; it does not add an English interface.
@@ -124,6 +125,7 @@ Let conversation participants know they are interacting with an AI. Before publi
 
 Every update is tagged as a small version (`v0.x`); the full notes are in [CHANGELOG.md](CHANGELOG.md).
 
+- **v0.10** — Drawing moves to a local Stable Diffusion WebUI Forge; requests become Danbooru tags, and named characters are looked up on Danbooru so they stay recognisable; the 画图 tab picks the Forge model and can start Forge or load/unload its model.
 - **v0.9** — Console tabs for a timed blocklist (with a notice to the blocked person) and for naming group members; Chinese nicknames read with RapidOCR; "生成一张…" draws; private chats recover a lost place, and 重新接话 picks up requests that never reached her; her own openings start new topics.
 - **v0.8** — Voice messages through WeChat's own voice-to-text; private chats always answered and a 重新接话 button; a persona that refuses lewd requests and hits back at insults; a new contact's first visit finds its place; image descriptions no longer invent captions or names; no more Tk crashes in the test run.
 - **v0.7** — Drawing rights and limits per allowed chat, live drawing-job states, a chat selector that stays synchronized, and periodic memory updates for every allowed chat with progress restored after restart.

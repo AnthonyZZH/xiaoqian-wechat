@@ -71,7 +71,7 @@ class AgentBridgeTests(Temp):
                                                 "workdir": str(self.dir / 'work' / name), "timeout": 20,
                                                 "env": {"PYTHONIOENCODING": "utf-8"}}
                                          for name in ("claude", "codex", "deepseek")}
-                        | {"draw": {"cmd": [sys.executable, "-c", PAINTER, "{task}"], "workdir": str(self.dir / 'work' / 'draw'),
+                        | {"draw": {"backend": "process", "cmd": [sys.executable, "-c", PAINTER, "{task}"], "workdir": str(self.dir / 'work' / 'draw'),
                                     "timeout": 20, "env": {"PYTHONIOENCODING": "utf-8"}}})
         bot = Bot(settings, PersonaStore(self.dir / 'p'), reply_latest,
                   log_dir=self.dir / 'logs', data_dir=self.dir / 'data')
@@ -853,6 +853,43 @@ class AgentBridgeTests(Temp):
         self.assertEqual(wx.open, '示例好友')
 
     # ---- drawing: Codex's image tool, sent back where it was asked for ----
+    def test_forge_image_follows_the_existing_request_chat_and_gallery_pipeline(self):
+        bot, wx = self.make()
+        overrides = bot.settings['agent_overrides']
+        overrides['draw']['backend'] = 'forge'
+        bot.settings.update(agent_overrides=overrides, draw_params={'steps': 20})
+        bot.brain.draw_prompts = mock.Mock(return_value={
+            'prompt': 'yukinoshita yukino, 1girl, black hair, bikini', 'negative': 'school uniform',
+            'characters': ['yukinoshita_yukino']})
+        calls = []
+
+        def generate(client, prompt, model, output, **kwargs):
+            calls.append((prompt, model, kwargs['params'], kwargs['negative']))
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            from PIL import Image
+            Image.new('RGB', (8, 8)).save(output)
+            return Path(output)
+        self.tick(bot)
+        with mock.patch('agents.find_codex', side_effect=AssertionError('Forge must not start Codex')), \
+                mock.patch('forge.Forge.generate', generate):
+            self.owner_says(bot, wx, '画一张雪之下雪乃穿比基尼')
+            self.wait_jobs(bot)
+        self.tick(bot, 3)
+        job, = bot.agents.jobs()
+        self.assertEqual(job.status, 'done', job.tail)
+        self.assertEqual(wx.sent[-1], ('示例好友', f'IMG:{job.id}.png'))
+        self.assertEqual(bot.drawings_list()[0]['what'], '一张雪之下雪乃穿比基尼')
+        args, kwargs = bot.brain.draw_prompts.call_args
+        self.assertEqual(args, ('一张雪之下雪乃穿比基尼', bot.settings['forge_model']))
+        self.assertTrue(callable(kwargs['search']))  # named characters may be looked up online
+        self.assertEqual(calls, [('yukinoshita yukino, 1girl, black hair, bikini', bot.settings['forge_model'],
+                                  {'steps': 20}, 'school uniform')])
+        self.assertIn('一张雪之下雪乃穿比基尼', job.task)
+        self.assertEqual(bot.draw_jobs()[0]['prompt'],
+                         'yukinoshita yukino, 1girl, black hair, bikini\n负面：school uniform')
+        self.assertIn('角色参考（Danbooru）：yukinoshita_yukino', job.tail)
+        self.assertEqual(bot.draw_jobs()[0]['state'], '已发出')
+
     def test_owner_asks_for_a_drawing_in_private(self):
         bot, wx = self.make()
         self.tick(bot)

@@ -12,7 +12,7 @@
             并且不启用 Bash/PowerShell，因此不会自动执行删除类命令。
 - codex:    Codex 应用自带的 codex-cli（每次启动重新 find_codex），
             exec + workspace-write 沙箱 + -C 工作目录。
-- draw:     与 codex 相同的命令，但使用独立工作目录和较短超时，专门生成图片。
+- draw:     通过本机 Stable Diffusion WebUI Forge 的 API 生成图片，独立后台任务，不占用 Codex。
 - deepseek: DeepSeek Harness 的 headless 模式，cwd 就是沙箱 workspaceRoot，
             DSH_PERMISSION_MODE=workspace-write。
 """
@@ -356,12 +356,11 @@ def default_configs() -> dict:
             "reasoning": "high",
         },
         "draw": {
-            # --search 是 codex 顶层参数，必须放在 exec 前；exec 子命令本身不接受它。
-            "cmd": ["{codex}", "--search", *codex_cmd[1:]],
+            "backend": "forge",
+            "url": "http://127.0.0.1:7860",
             "workdir": _default_workdir("draw"),
-            "timeout": 300,
-            "model": "gpt-6.1-sol",
-            "reasoning": "low",
+            "timeout": 600,
+            "model": "waiIllustriousSDXL_v170.safetensors [f116b0c78f]",
         },
         "deepseek": {
             # 直接执行 dsh.cmd 内部等价的那条 Electron 命令：headless 单次任务。
@@ -563,7 +562,7 @@ class AgentJobs:
 
     # -- 对外 API ----------------------------------------------------------
 
-    def start(self, agent: str, task: str) -> str:
+    def start(self, agent: str, task: str, *, prepare=None) -> str:
         """后台启动一个任务，立即返回 job_id。"""
         if not isinstance(task, str) or not task.strip():
             raise ValueError("任务不能为空")
@@ -583,6 +582,10 @@ class AgentJobs:
             )
             snapshot = copy.deepcopy(config)
             job = AgentJob(job_id, agent, task, self.log_dir / f"{job_id}.log")
+            job.backend = snapshot.get("backend", "process")
+            job.image_path = None
+            job.prepare = prepare
+            job.prompt = None
             self._jobs.append(job)
 
         thread = threading.Thread(
@@ -629,6 +632,10 @@ class AgentJobs:
             output = "任务在启动前被停止。\n"
             self._write_log(job.log_path, output)
             self._finish(job, "stopped", None, output)
+            return
+
+        if config.get("backend") == "forge":
+            self._run_forge(job, config)
             return
 
         try:
@@ -742,6 +749,58 @@ class AgentJobs:
             status = "failed"
         self._finish(job, status, returncode, output)
 
+    def _run_forge(self, job: AgentJob, config: dict) -> None:
+        """Use the same job lifecycle without blocking the WeChat scheduler or spawning Codex."""
+        from forge import DrawingStopped, Forge
+        lines = []
+
+        def log(text):
+            lines.append(str(text))
+            self._write_log(job.log_path, "\n".join(lines) + "\n")
+
+        try:
+            started = time.monotonic()
+            timeout = self._timeout(config)
+            workdir = self._prepare_workdir(job.agent, config)
+            prompt, negative = job.task, ""
+            if job.prepare:
+                log(f"原始描述：{job.task}")
+                prepared = job.prepare(job.task)
+                if isinstance(prepared, dict):  # {prompt, negative, characters}
+                    prompt, negative = prepared["prompt"], prepared.get("negative", "")
+                    if prepared.get("characters"):
+                        log("角色参考（Danbooru）：" + ", ".join(prepared["characters"]))
+                else:
+                    prompt = prepared
+                log(f"英文提示词：{prompt}")
+                if negative:
+                    log(f"额外负面词：{negative}")
+            if job._stop_event.is_set():
+                raise DrawingStopped("画图已停止")
+            job.prompt = prompt + (f"\n负面：{negative}" if negative else "")
+            if timeout:
+                timeout -= time.monotonic() - started
+                if timeout <= 0:
+                    raise TimeoutError("英文提示词转换耗时超过画图时限")
+            result = Forge(config["url"]).generate(
+                prompt, config["model"], workdir / "images" / f"{job.id}.png", params=config.get("params"),
+                negative=negative,
+                timeout=timeout, cancel=job._stop_event.is_set, log=log)
+            if job._stop_event.is_set():
+                raise DrawingStopped("画图已停止")
+            job.image_path = result
+            status, code = "done", 0
+        except DrawingStopped as exc:
+            log(exc)
+            status, code = "stopped", None
+        except TimeoutError as exc:
+            log(exc)
+            status, code = "timeout", None
+        except Exception as exc:
+            log(f"没画出来：{exc}")
+            status, code = "failed", 1
+        self._finish(job, status, code, "\n".join(lines) + "\n")
+
     def _finish(
         self,
         job: AgentJob,
@@ -750,6 +809,8 @@ class AgentJobs:
         output: str,
     ) -> None:
         with self._lock:
+            if getattr(job, "backend", "") == "forge" and job._stop_event.is_set():
+                status, returncode, job.image_path = "stopped", None, None
             job.status = status
             job.returncode = returncode
             job.finished = time.time()

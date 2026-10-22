@@ -101,6 +101,22 @@ class BrainTests(Temp):
         brain.decide([{'role': 'user', 'text': 'hi', 'sender': 'x'}], chat='示例好友', mode='private')
         self.assertEqual(brain.post.call_args[0][0]['messages'][1]['content'], 'hi')
 
+    def test_drawing_description_becomes_english_without_chat_history(self):
+        brain = self.make(self.reply('{"prompt":"1girl, solo, cat ears, cute"}'))
+        text = brain.image_prompt('一张可爱的猫耳娘', 'waiIllustriousSDXL_v170.safetensors')
+        self.assertEqual(text, '1girl, solo, cat ears, cute')
+        messages = brain.post.call_args.args[0]['messages']
+        self.assertEqual(len(messages), 2)
+        self.assertIn('Description: 一张可爱的猫耳娘', messages[-1]['content'])
+        self.assertIn('ONLY the supplied description', messages[0]['content'])
+
+    def test_image_prompt_rejects_untranslated_chinese_but_keeps_requested_lettering(self):
+        brain = self.make(self.reply('{"prompt":"一张可爱的猫耳娘"}'))
+        with self.assertRaisesRegex(ValueError, '转换失败'):
+            brain.image_prompt('一张可爱的猫耳娘')
+        brain.post.return_value = self.reply(json.dumps({'prompt': 'a cat, text "不想上班"'}, ensure_ascii=False))
+        self.assertEqual(brain.image_prompt('猫咪表情包写“不想上班”'), 'a cat, text "不想上班"')
+
     def test_truncated_output_raises_and_is_logged(self):
         brain = self.make(self.reply('{"speak": true, "te', finish='length'))
         with self.assertRaises(ValueError):
@@ -578,6 +594,39 @@ class GalleryTests(Temp):
         app = App(bot)
         app.window.withdraw()
         try:
+            from forge import LEGACY_LABEL
+            original_chat_model = bot.settings['model']
+            selected = 'other.safetensors [0123456789]'
+            bot.emit('draw_models', {'url': 'http://127.0.0.1:7860', 'error': '', 'models': [
+                {'id': selected, 'label': 'other'}]})
+            app.pump()
+            app.draw_model.set('other')
+            app.forge_url.delete(0, 'end')
+            app.forge_url.insert(0, 'http://127.0.0.1:7860/')
+            app.save_draw_model()
+            self.assertEqual(bot.settings['forge_model'], selected)
+            self.assertEqual(bot.agent_configs()['draw']['model'], selected)
+            self.assertEqual(bot.settings['forge_url'], 'http://127.0.0.1:7860')
+            self.assertEqual(bot.settings['model'], original_chat_model)
+            app.draw_model.set(LEGACY_LABEL)
+            app.save_draw_model()
+            legacy = bot.agent_configs()['draw']
+            self.assertEqual(legacy['backend'], 'process')
+            self.assertEqual(legacy['cmd'][:3], ['{codex}', '--search', 'exec'])
+            self.assertEqual(bot.settings['forge_model'], selected)  # kept for switching back
+            app.draw_model.set('other')
+            app.save_draw_model()
+            self.assertEqual(bot.agent_configs()['draw']['backend'], 'forge')
+            with mock.patch.object(bot, 'fetch_draw_models') as fetch:
+                app.refresh_draw_models()
+                fetch.assert_called_once_with('http://127.0.0.1:7860')
+            with mock.patch.object(bot, 'control_draw_model') as control:
+                for i, action in enumerate(('start', 'load', 'unload')):
+                    app.draw_control_buttons[i].invoke()
+                    control.assert_called_with(action, 'http://127.0.0.1:7860', selected)
+                    bot.emit('draw_control_result', '操作完成')
+                    app.pump()
+                    self.assertEqual(app.draw_model_status.get(), '操作完成')
             self.assertIn('一只橘猫', app.gallery_list.get(0))
             self.assertIn('示例好友', app.gallery_list.get(0))
             self.assertEqual(app.gallery_dir.get(), str(folder))

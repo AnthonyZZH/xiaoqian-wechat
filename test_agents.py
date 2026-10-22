@@ -31,15 +31,17 @@ class DefaultConfigTests(unittest.TestCase):
         cmd = default_configs()["claude"]["cmd"]
         self.assertEqual(cmd[-2:], ["--", "{task}"])
 
-    def test_draw_is_an_independent_low_reasoning_codex_agent(self):
+    def test_draw_is_an_independent_local_forge_job(self):
         configs = default_configs()
         draw, codex = configs["draw"], configs["codex"]
-        self.assertEqual(draw["cmd"][:3], ["{codex}", "--search", "exec"])
+        self.assertEqual(draw["backend"], "forge")
+        self.assertEqual(draw["url"], "http://127.0.0.1:7860")
+        self.assertNotIn("cmd", draw)
         self.assertNotIn("--search", codex["cmd"])
-        self.assertEqual([arg for arg in draw["cmd"] if arg != "--search"], codex["cmd"])
-        self.assertEqual(draw["model"], "gpt-6.1-sol")
-        self.assertEqual(draw["reasoning"], "low")
-        self.assertEqual(draw["timeout"], 300)
+        self.assertEqual(codex["model"], "gpt-6.1-sol")
+        self.assertEqual(codex["reasoning"], "high")
+        self.assertEqual(draw["model"], "waiIllustriousSDXL_v170.safetensors [f116b0c78f]")
+        self.assertEqual(draw["timeout"], 600)
         self.assertNotEqual(draw["workdir"], codex["workdir"])
         self.assertEqual(Path(draw["workdir"]).name, "draw")
 

@@ -2,6 +2,13 @@
 
 Each update to this repository is tagged as a small version (`v0.1`, `v0.2`, …).
 
+## v0.10
+
+- Drawing uses a local Stable Diffusion WebUI Forge through its A1111 API (`forge.py`). Each picture sets its own checkpoint and clip skip through `override_settings` and restores them afterwards, so Forge's global settings never change. A stopped picture is discarded rather than interrupted, because `/sdapi/v1/interrupt` would also stop another front end's picture. Defaults suit Illustrious SDXL: DPM++ 2M, 28 steps, CFG 5.5, 832×1216, clip skip 2, plus quality and negative tags (including `nsfw, nude`). They can be overridden in `draw_params`.
+- The request is turned into Danbooru-style English tags by the chat model. Untranslated Chinese is never sent to the image model.
+- Named characters (`characters.py`): the chat model guesses each character's Danbooru tag. The guess is checked against Danbooru, and a web search for "<name> danbooru" corrects it, counting only links on donmai.us itself. The character's usual look and series come from `related_tag`. The positive prompt holds the character and series tags, the look and the requested outfit and scene. The negative prompt holds the usual outfit when another one is asked for, plus colours that no requested character has. A character's own look, including weighted forms such as `(black_hair:1.4)`, never goes into the negative. If Danbooru is unreachable the picture is drawn from the description.
+- 画图 tab: Forge address, model list, start Forge (`forge_root`), and load or unload the model, which is refused while Forge is busy. The Codex online-reference mode is still selectable.
+
 ## v0.9
 
 - Console 黑名单 tab: block a group member or a private contact, in one chat or everywhere, for a set time or for good (default "当太阳从西边升起"). The blocked person gets one notice, with a real @ in groups. The owner can also say "拉黑 X 2小时". Entries are `{name, chat, until}`; older plain-name entries still count.

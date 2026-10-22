@@ -43,7 +43,7 @@ UNBLOCK = re.compile(r"(?:解除拉黑|取消拉黑|解除屏蔽|取消屏蔽|�
 BLOCK = re.compile(r"(?:(?:不允许|不准|不许|不要|别)再?(?:接收|接受|理|回复|回|搭理|听)|拉黑|屏蔽)\s*"
                    r"(?P<name>.+?)\s*(?:的消息|的话|发的消息)?[。.!！]*")
 BLOCKLIST = re.compile(r"(?:看看|查看)?(?:黑名单|拉黑名单|屏蔽名单)[?？]*")
-# "画一只橘猫" / "帮我画：…": a picture by Codex's image tool, sent back where it was asked for.
+# "画一只橘猫" / "帮我画：…": a picture by the selected backend, sent back where it was asked for.
 DRAW = re.compile(r"(?P<ask>请|你|帮我|给我|请你|你帮我|你给我)?(?P<verb>画|生成|做|来|整|弄)(?:一下)?\s*"
                   r"(?P<colon>[:：])?\s*(?P<what>.+)")
 # "生成" is about pictures anyway; 做/来/整/弄 only when the picture is named ("帮我做个PPT" is not).
@@ -104,6 +104,8 @@ class Bot:
         self.pictures = []   # (chat, image path or None, what, job id): finished, waiting to be sent
         self.gallery_lock = threading.Lock()  # images/index.json: the worker writes, the console reads
         self.draw_log = deque(maxlen=30)  # what really happened to each drawing, for the console
+        self.draw_control_lock = threading.RLock()
+        self.draw_control_busy = False
         self.previews = {}   # chat -> last seen session-list preview, to notice news elsewhere
         self.incoming = ChatQueue()
         self.route_retry = {}
@@ -125,7 +127,7 @@ class Bot:
 
     def emit(self, kind, payload):
         self.events.put((kind, payload))
-        if kind in ("sessions", "models", "stickers", "chats", "memory", "memory_edit_result", "inbox"):
+        if kind in ("sessions", "models", "draw_models", "draw_control_result", "stickers", "chats", "memory", "memory_edit_result", "inbox"):
             return
         record = {"time": datetime.now().astimezone().isoformat(), "kind": kind,
                   "chat": self.settings["chat"], "text": payload}
@@ -657,7 +659,13 @@ class Bot:
         return None
 
     def draw(self, what, here=None, who="主人"):
-        """Hand a picture to Codex's image tool; it is sent to `here` (a group) or the owner when done."""
+        with self.draw_control_lock:
+            if self.draw_control_busy:
+                return "正在启动或加载/卸载生图模型，稍等一下再画"
+            return self._draw(what, here, who)
+
+    def _draw(self, what, here=None, who="主人"):
+        """Queue a picture independently of chatting; send it back to the requesting chat."""
         import agents
         chat = here.chat if here else self.settings["owner"]
         what = " ".join(what.split()).strip("。.!！~～")[:200]
@@ -665,7 +673,16 @@ class Bot:
             return "上一张还在画，画完再说"
         self.agents.configs = self.agent_configs()
         try:
-            job_id = self.agents.start("draw", agents.draw_task(what))
+            config = self.agents.configs["draw"]
+            task = what if config.get("backend") == "forge" else agents.draw_task(what)
+            if config.get("backend") == "forge":
+                # Translate in the drawing thread; never block the WeChat scheduler.
+                model = config["model"]
+                import websearch
+                job_id = self.agents.start("draw", task, prepare=lambda description: self.brain.draw_prompts(
+                    description, model, search=websearch.search))
+            else:
+                job_id = self.agents.start("draw", task)
         except Exception as exc:
             return f"没法画：{exc}"
         self.drawings[job_id] = (chat, what)
@@ -673,7 +690,8 @@ class Bot:
             self.draw_log.appendleft({"id": job_id, "who": who, "chat": chat, "what": what,
                                       "state": "画图中", "started": time.time(), "ended": None, "note": ""})
         self.emit("status", f"开始画：{what[:40]}")
-        return "好，画好了发出来，大概要一分钟"
+        return "好，已经排队画了，画好了发出来" if config.get("backend") == "forge" else \
+            "好，画好了发出来，大概要一分钟"
 
     def draw_state(self, job_id, state, note=None):
         with self.gallery_lock:
@@ -686,7 +704,9 @@ class Bot:
 
     @staticmethod
     def draw_reason(job):
-        """Why a drawing failed, in Codex's own last words (a refusal, NO_IMAGE_TOOL, a timeout)."""
+        """Why a drawing failed, including local model/server errors and legacy Codex output."""
+        if getattr(job, "backend", "") == "forge" and job.tail:
+            return str(job.tail).splitlines()[-1][:160]
         if job.status != "done":
             return JOB_STATES.get(job.status, job.status)
         last = [line.strip() for line in str(job.tail).splitlines() if line.strip()]
@@ -695,8 +715,10 @@ class Bot:
     def draw_jobs(self):
         """Recent drawings, newest first, with seconds so far for the ones still being drawn."""
         now = time.time()
+        prompts = {job.id: getattr(job, "prompt", None) for job in self.agents.jobs()}
         with self.gallery_lock:
-            return [dict(e, seconds=int((e["ended"] or now) - e["started"])) for e in self.draw_log]
+            return [dict(e, prompt=prompts.get(e["id"]), seconds=int((e["ended"] or now) - e["started"]))
+                    for e in self.draw_log]
 
     def draw_folder(self):
         """Where finished drawings are kept (shown on the console's 画图 page)."""
@@ -750,6 +772,10 @@ class Bot:
         import agents
         if job.status != "done":
             return None
+        if getattr(job, "backend", "") == "forge":
+            # Captured by this job, not a scan of another job's images or a mutable model setting.
+            path = getattr(job, "image_path", None)
+            return Path(path) if path and Path(path).is_file() else None
         try:
             return agents.find_image(job, Path(self.agent_configs()["draw"]["workdir"]))
         except Exception as exc:
@@ -911,6 +937,15 @@ class Bot:
         for name, extra in (self.settings.get("agent_overrides") or {}).items():
             if name in configs and isinstance(extra, dict):
                 configs[name].update(extra)
+        from forge import DEFAULT_MODEL, DEFAULT_URL, LEGACY_MODEL
+        configs["draw"]["url"] = self.settings.get("forge_url") or DEFAULT_URL
+        configs["draw"]["model"] = self.settings.get("forge_model") or DEFAULT_MODEL
+        configs["draw"]["params"] = self.settings.get("draw_params") or {}
+        if self.settings.get("draw_backend") == LEGACY_MODEL:
+            # Explicit opt-in preserves the old online-reference workflow; never a silent fallback.
+            codex_cmd = default_configs()["codex"]["cmd"]
+            configs["draw"].update(backend="process", cmd=["{codex}", "--search", *codex_cmd[1:]],
+                                   model="gpt-6.1-sol", reasoning="low", timeout=300)
         return configs
 
     @staticmethod
@@ -1173,6 +1208,46 @@ class Bot:
                 self.emit("models", {"models": self.lm.models(), "loaded": self.lm.instances()})
             except Exception as exc:
                 self.emit("error", f"读取模型列表失败：{exc}")
+        threading.Thread(target=job, daemon=True).start()
+
+    def fetch_draw_models(self, url):
+        # Network work never runs on the Tk thread or WeChat's worker thread.
+        def job():
+            from forge import Forge
+            try:
+                models = Forge(url).models()
+                self.emit("draw_models", {"url": url, "models": models, "error": ""})
+            except Exception as exc:
+                self.emit("draw_models", {"url": url, "models": [], "error": str(exc)})
+        threading.Thread(target=job, daemon=True).start()
+
+    def control_draw_model(self, action, url, model):
+        """Explicit UI-only model maintenance, serialized against this bot's drawing tasks."""
+        with self.draw_control_lock:
+            if self.draw_control_busy or any(j.agent == "draw" and j.status == "running" for j in self.agents.jobs()):
+                self.emit("draw_control_result", "画图或模型操作尚未结束，请稍后再试")
+                return
+            self.draw_control_busy = True
+            config = self.settings.snapshot()
+
+        def job():
+            from forge import Forge, start_server
+            try:
+                if action == "start":
+                    text = start_server(url, config, self.log_dir, cancel=self.stop.is_set)
+                elif action == "load":
+                    start_server(url, config, self.log_dir, cancel=self.stop.is_set)
+                    text = Forge(url).load()
+                elif action == "unload":
+                    text = Forge(url).unload()
+                else:
+                    raise ValueError("未知的模型操作")
+            except Exception as exc:
+                text = f"模型操作失败：{exc}"
+            finally:
+                with self.draw_control_lock:
+                    self.draw_control_busy = False
+            self.emit("draw_control_result", text)
         threading.Thread(target=job, daemon=True).start()
 
 
@@ -1879,6 +1954,38 @@ class App:
 
     # ---- 画图 ----
     def build_gallery(self, frame):
+        from forge import DEFAULT_MODEL
+        model_box = ttk.LabelFrame(frame, text="生图模型（本机 Forge / Stable Diffusion）", padding=8)
+        model_box.pack(fill="x", pady=(0, 8))
+        row = ttk.Frame(model_box)
+        row.pack(fill="x")
+        ttk.Label(row, text="服务地址：").pack(side="left")
+        self.forge_url = ttk.Entry(row, width=28)
+        self.forge_url.insert(0, self.settings["forge_url"])
+        self.forge_url.pack(side="left")
+        ttk.Button(row, text="刷新模型", command=self.refresh_draw_models).pack(side="left", padx=6)
+        row = ttk.Frame(model_box)
+        row.pack(fill="x", pady=4)
+        ttk.Label(row, text="模型：").pack(side="left")
+        self.draw_model = ttk.Combobox(row, state="readonly", width=32)
+        self.draw_model.pack(side="left", fill="x", expand=True)
+        model = self.settings["forge_model"] or DEFAULT_MODEL
+        self.set_draw_models({model.split(" [")[0].removesuffix(".safetensors"): model})
+        ttk.Button(row, text="保存模型", command=self.save_draw_model).pack(side="left", padx=6)
+        row = ttk.Frame(model_box)
+        row.pack(fill="x")
+        self.draw_control_buttons = []
+        for action, label in (("start", "启动 Forge"), ("load", "加载模型"), ("unload", "卸载生图模型")):
+            button = ttk.Button(row, text=label, command=lambda a=action: self.control_draw_model(a))
+            button.pack(side="left", padx=(0, 6))
+            self.draw_control_buttons.append(button)
+        self.draw_model_status = tk.StringVar(value="选择后保存，下一张生效；刷新可读取本机实际可用模型。")
+        ttk.Label(model_box, textvariable=self.draw_model_status, wraplength=760).pack(anchor="w", pady=(4, 0))
+        ttk.Label(model_box, text="Forge 可能和其他前端共用：画图参数只用于小千这一张，不改 Forge 的设置；"
+                  "它正在画图时不加载/卸载。卸载只释放 Forge 的显存，不动聊天模型。",
+                  wraplength=760).pack(anchor="w")
+        self.draw_prompt_text = tk.StringVar(value="英文提示词会在画图时自动转换，并显示在这里。")
+        ttk.Label(model_box, textvariable=self.draw_prompt_text, wraplength=740).pack(anchor="w")
         rights = ttk.LabelFrame(frame, text="画图授权（按聊天分别设置；主人永远不限）", padding=8)
         rights.pack(fill="x", pady=(0, 8))
         row = ttk.Frame(rights)
@@ -1942,9 +2049,56 @@ class App:
         self.show_gallery()
         self.window.after(500, self.show_draw_tasks)
 
+    def set_draw_models(self, options):
+        from forge import LEGACY_LABEL, LEGACY_MODEL
+        options = {**options, LEGACY_LABEL: LEGACY_MODEL}
+        self.draw_model_options = options
+        current = LEGACY_MODEL if self.settings["draw_backend"] == LEGACY_MODEL else self.settings["forge_model"]
+        label = next((label for label, name in options.items() if name == current), current)
+        self.draw_model["values"] = list(options)
+        self.draw_model.set(label)
+
+    def refresh_draw_models(self):
+        self.draw_model_status.set("正在读取 Forge 模型…")
+        self.bot.fetch_draw_models(self.forge_url.get().strip().rstrip("/"))
+
+    def control_draw_model(self, action):
+        from forge import LEGACY_MODEL, server_url
+        try:
+            url = server_url(self.forge_url.get())
+            model = self.draw_model_options.get(self.draw_model.get(), "")
+            if action == "load" and (not model or model == LEGACY_MODEL):
+                raise ValueError("请先选择一个 Forge 生图模型")
+        except ValueError as exc:
+            messagebox.showerror("生图模型", str(exc))
+            return
+        if action == "load":
+            self.settings.update(forge_url=url, forge_model=model, draw_backend="forge")
+        for button in self.draw_control_buttons:
+            button.configure(state="disabled")
+        self.draw_model_status.set("正在" + {"start": "启动 Forge…", "load": "加载模型…", "unload": "卸载生图模型…"}[action])
+        self.bot.control_draw_model(action, url, model)
+
+    def save_draw_model(self):
+        from forge import LEGACY_MODEL, server_url
+        try:
+            url = server_url(self.forge_url.get())
+            model = self.draw_model_options[self.draw_model.get()]
+        except (ValueError, KeyError) as exc:
+            messagebox.showerror("生图模型", str(exc) if isinstance(exc, ValueError) else "请先刷新并选择一个可用模型")
+            return
+        if model == LEGACY_MODEL:
+            self.settings.update(forge_url=url, draw_backend=LEGACY_MODEL)
+        else:
+            self.settings.update(forge_url=url, forge_model=model, draw_backend="forge")
+        self.draw_model_status.set("已保存，下一张使用：" + self.draw_model.get() + "；正在画的任务保持原模型。")
+
     def show_draw_tasks(self):
         try:
             jobs = self.bot.draw_jobs()
+            latest_prompt = next((j["prompt"] for j in jobs if j.get("prompt")), "")
+            if latest_prompt:
+                self.draw_prompt_text.set("英文提示词：" + latest_prompt[:500])
             rows = []
             for job in jobs:
                 when = datetime.fromtimestamp(job["started"]).strftime("%H:%M")
@@ -2278,6 +2432,19 @@ class App:
                     continue
                 if kind == "models":
                     self.show_models(payload)
+                    continue
+                if kind == "draw_models":
+                    if payload["url"] == self.forge_url.get().strip().rstrip("/"):
+                        if payload["error"]:
+                            self.draw_model_status.set(payload["error"])
+                        else:
+                            self.set_draw_models({m["label"]: m["id"] for m in payload["models"]})
+                            self.draw_model_status.set(f"找到 {len(payload['models'])} 个可用模型；选择后点“保存模型”。")
+                    continue
+                if kind == "draw_control_result":
+                    self.draw_model_status.set(payload)
+                    for button in self.draw_control_buttons:
+                        button.configure(state="normal")
                     continue
                 if kind == "stickers":
                     self.show_stickers(payload)

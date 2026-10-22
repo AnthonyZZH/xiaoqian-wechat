@@ -67,6 +67,13 @@ DEFAULTS = {
     "draw_unlimited": [],  # group member names with no daily limit
     # Per chat, set on the console: {chat: {"enabled", "who": "all"|"listed", "names", "limit", "unlimited"}}.
     "draw_rights": {},
+    # Local Stable Diffusion WebUI Forge (may be shared with other front ends); does not change the chat model.
+    "draw_backend": "forge",  # or "codex-reference": the old Codex online-reference drawing
+    "forge_url": "http://127.0.0.1:7860",
+    "forge_model": "waiIllustriousSDXL_v170.safetensors [f116b0c78f]",
+    "forge_root": r"C:\stable-diffusion-webui-forge",
+    # Over forge.DEFAULT_PARAMS (common defaults): steps, cfg_scale, width, height, sampler_name, prefix, negative…
+    "draw_params": {},
 }
 
 
