@@ -82,7 +82,7 @@ class Runner:
                  memory_dir: Path = DATA / "memory", outbound_mode=None):
         self.stickers = stickers
         self.memory = Memory(Path(memory_dir) / f"{safe_name(chat)}.json")
-        self.unlearned, self.learn_failed_at = 0, -NEVER
+        self.learn_failed_at = -NEVER
         self.recent_stickers = deque()  # (monotonic, image hash) of stickers we pasted
         self.partner = ("", 0.0)  # group member last answered, and when
         # Owner tools, wired up by the scheduler: which chats she may speak in on the
@@ -118,6 +118,9 @@ class Runner:
         self.seen, self.seen_order = set(), deque()
         self.history_path = Path(history_dir) / f"{safe_name(chat)}.json"
         self.history = load_history(self.history_path, chat)
+        # Where memory got to, kept next to the history so a restart does not forget it.
+        self.learned_path = self.history_path.with_suffix(".learned")
+        self.unlearned, self.learned_at = self.load_learned()
         self.pending = []
         self.last_incoming = self.last_send = 0.0
         self.next_proactive = NEVER
@@ -148,6 +151,29 @@ class Runner:
         if len(self.seen_order) > 1200:
             self.seen.discard(self.seen_order.popleft())
         return True
+
+    def load_learned(self):
+        """(user messages since the last memory update, when that was in wall-clock seconds)."""
+        try:
+            mark = json.loads(self.learned_path.read_text(encoding="utf-8"))
+            last, at = tuple(mark["last"]), float(mark["at"])
+        except (OSError, ValueError, KeyError, TypeError):
+            last, at = None, 0.0
+        start = 0
+        for i in range(len(self.history) - 1, -1, -1):
+            if last and (self.history[i]["role"], compact(self.history[i]["text"])) == last:
+                start = i + 1
+                break
+        return sum(row["role"] == "user" for row in self.history[start:]), at
+
+    def mark_learned(self, rows):
+        self.learned_at = time.time()
+        mark = {"last": [rows[-1]["role"], compact(rows[-1]["text"])], "at": self.learned_at}
+        try:
+            self.learned_path.parent.mkdir(parents=True, exist_ok=True)
+            self.learned_path.write_text(json.dumps(mark, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
 
     def save(self):
         self.history = self.history[-max(self.config["history_messages"], 10):]
@@ -251,11 +277,15 @@ class Runner:
         if self.blocked(sender):
             return False  # the owner said not to take in this person's messages at all
         self.on_heard()
-        if self.mode == "group" and sender and getattr(row, "image", None) is None:
-            handled = self.group_command(row.text, act=not self.replaying, sender=sender)
+        # A group member addressing her, or a private contact other than the owner: drawing (within
+        # the console's rights) and, for the owner in a group, blocking and memory.
+        member = sender if self.mode == "group" else ("" if self.is_owner() else self.chat)
+        if member and getattr(row, "image", None) is None:
+            handled = self.group_command(row.text, act=not self.replaying, sender=member)
             if handled:
-                self.history.append({"role": "user", "text": handled["log"], "sender": sender})
-                self.emit("received", f"{sender}：{handled['log']}")
+                self.history.append({"role": "user", "text": handled["log"],
+                                     **({"sender": sender} if self.mode == "group" else {})})
+                self.emit("received", f"{sender}：{handled['log']}" if self.mode == "group" else handled["log"])
                 if handled.get("reply"):
                     self.notices.append(handled["reply"])
                 return True
@@ -517,7 +547,7 @@ class Runner:
         rows += [r.get("sender", "") for r in reversed(self.history[-20:])]
         return [n for n in dict.fromkeys(rows) if n and not n.startswith("群友")]
 
-    def learn(self, now, force=False):
+    def learn(self, now, force=False, timed=False):
         """Update long-term memory from recent chat while the chat is quiet.
 
         Runs between conversations (never with a reply pending) so it does not
@@ -526,7 +556,10 @@ class Runner:
         self.learn_note = "记忆功能已关闭"
         if not self.config["memory_enabled"]:
             return False
-        if not force:
+        if timed and not self.unlearned:
+            self.learn_note = "这段聊天没什么要记的"
+            return False
+        if not force and not timed:
             if self.pending or not self.unlearned:
                 return False
             due = (self.unlearned >= self.config["memory_every"] and now - self.last_incoming >= 30) \
@@ -549,6 +582,7 @@ class Runner:
             return False
         changed = self.memory.apply(update, names)
         self.unlearned = 0
+        self.mark_learned(rows)
         self.learn_note = f"记住了 {changed} 条新东西" if changed else "这段聊天没什么要记的"
         self.status(self.learn_note)
         return True

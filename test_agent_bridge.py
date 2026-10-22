@@ -984,3 +984,124 @@ class AgentBridgeTests(Temp):
         self.assertFalse(item['path'].exists())
         self.assertEqual(bot.drawings_list(), [])
         self.assertEqual(bot.gallery_notes(), {})
+
+    def test_drawing_rights_unlimited_members_zero_limit_and_the_measure_word(self):
+        bot, wx = self.make()
+        bot.settings.update(aliases=['机器人昵称'], draw_unlimited=['测试群友'], draw_daily_limit=0)
+        self.tick(bot)
+        for n in range(2):
+            wx.post('示例群甲', f'@机器人昵称 画个戴帽子的狗{n}', sender='测试群友')
+            self.tick(bot, 3)
+            self.wait_jobs(bot)
+            self.tick(bot, 4)
+        self.assertEqual(len(bot.agents.jobs()), 2)
+        self.assertIn(('示例群甲', '测试群友 好，画好了发出来，大概要一分钟'), wx.sent)
+        self.assertEqual(bot.drawings_list()[0]['what'], '戴帽子的狗1')
+        self.assertEqual(bot.draw_usage('示例群甲'), {})
+        wx.post('示例群甲', '@机器人昵称 画只猫', sender='momo')
+        self.tick(bot, 3)
+        self.assertEqual(wx.sent[-1], ('示例群甲', 'momo 群友画图现在没有名额，找主人开一下'))
+        self.assertEqual(len(bot.agents.jobs()), 2)
+
+    def test_the_console_sees_what_really_happened_to_each_drawing(self):
+        bot, wx = self.make()
+        bot.settings.update(aliases=['机器人昵称'])
+        self.tick(bot)
+        self.owner_says(bot, wx, '画一只橘猫')
+        job, = bot.draw_jobs()
+        self.assertEqual((job['who'], job['chat'], job['what'], job['state']),
+                         ('主人', '示例好友', '一只橘猫', '画图中'))
+        self.wait_jobs(bot)
+        self.tick(bot, 3)
+        job, = bot.draw_jobs()
+        self.assertEqual(job['state'], '已发出')
+        self.assertTrue(job['note'].endswith('.png'))
+        wx.post('示例群甲', '@机器人昵称 画一张画不出来的东西', sender='测试群友')
+        self.tick(bot, 3)
+        self.wait_jobs(bot)
+        self.tick(bot, 4)
+        failed = bot.draw_jobs()[0]
+        self.assertEqual((failed['who'], failed['chat'], failed['state']),
+                         ('测试群友', '示例群甲', '没画出来'))
+        self.assertEqual(failed['note'], 'done')
+
+    def test_private_contacts_draw_only_when_allowed(self):
+        bot, wx = self.make()
+        bot.settings.update(chats={'示例好友': {'mode': 'private'}, '示例群甲': {'mode': 'group'},
+                                   '示例联系人甲': {'mode': 'private'}, '示例联系人乙': {'mode': 'private'}},
+                            draw_rights={'示例联系人甲': {'enabled': True, 'limit': 1}})
+        for name in ('示例联系人甲', '示例联系人乙'):
+            wx.chats[name], wx.modes[name] = [], 'private'
+            wx.post(name, '很久以前的私聊')
+        self.tick(bot)
+        for name in ('示例联系人甲', '示例联系人乙'):
+            wx.post(name, '在吗')
+            self.tick(bot, 4)
+        wx.post('示例联系人乙', '画一只猫')
+        self.tick(bot, 4)
+        self.assertIn(('示例联系人乙', '画图没对你开放哦'), wx.sent)
+        wx.post('示例联系人甲', '画一只猫')
+        self.tick(bot, 4)
+        self.assertIn(('示例联系人甲', '好，画好了发出来，大概要一分钟（今天还能画 0 张）'), wx.sent)
+        self.wait_jobs(bot)
+        self.tick(bot, 4)
+        job, = bot.agents.jobs()
+        self.assertIn(('示例联系人甲', f'IMG:{job.id}.png'), wx.sent)
+        self.assertEqual(bot.draw_usage('示例联系人甲'), {'示例联系人甲': 1})
+        wx.post('示例联系人甲', '画一只狗')
+        self.tick(bot, 4)
+        self.assertEqual(wx.sent[-1], ('示例联系人甲', '今天已经画了 1 张啦，明天再来'))
+
+    def test_a_group_can_allow_only_listed_people(self):
+        bot, wx = self.make()
+        bot.settings.update(aliases=['机器人昵称'], draw_rights={'示例群甲': {
+            'enabled': True, 'who': 'listed', 'names': ['测试群友'], 'limit': 2}})
+        self.tick(bot)
+        wx.post('示例群甲', '@机器人昵称 画一只猫', sender='momo')
+        self.tick(bot, 3)
+        self.assertEqual(wx.sent[-1], ('示例群甲', 'momo 画图没对你开放哦'))
+        wx.post('示例群甲', '@机器人昵称 画一只猫', sender='测试群友')
+        self.tick(bot, 3)
+        self.assertEqual(wx.sent[-1], ('示例群甲', '测试群友 好，画好了发出来，大概要一分钟（今天还能画 1 张）'))
+        self.assertEqual(bot.draw_usage('示例群甲'), {'测试群友': 1})
+
+    # ---- memory brought up to date on a timer, private chats too ----
+    def test_memory_progress_survives_a_restart(self):
+        bot, wx = self.make([{'speak': False, 'to_me': True, 'text': ''}] * 20)
+        learned = []
+        bot.brain.learn = lambda rows, **kw: learned.append(kw['chat']) or {'people': [], 'jargon': [], 'style': ''}
+        self.tick(bot)
+        owner = bot.runners['示例好友']
+        before = owner.unlearned
+        for n in range(3):
+            self.owner_says(bot, wx, f'今天第{n}件事', ticks=2)
+        self.assertEqual(owner.unlearned, before + 3)
+        owner.learn(time.monotonic(), timed=True)
+        self.assertEqual(learned, ['示例好友'])
+        self.assertTrue(owner.learned_path.is_file())
+        self.owner_says(bot, wx, '后来又说了一句', ticks=2)
+        again = type(owner)(owner.config, wx, bot.enabled, bot.stop, bot.emit, bot.brain, '示例好友',
+                            history_dir=self.dir / 'data' / 'history', memory_dir=self.dir / 'data' / 'memory')
+        self.assertEqual(again.unlearned, 1)
+        self.assertGreater(again.learned_at, 0)
+
+    def test_timed_sweep_updates_the_chat_with_most_news_even_when_closed(self):
+        bot, wx = self.make([{'speak': False, 'to_me': True, 'text': ''}] * 30)
+        bot.settings.update(memory_auto_min_new=3)
+        learned = []
+        bot.brain.learn = lambda rows, **kw: learned.append(kw['chat']) or {'people': [], 'jargon': [], 'style': ''}
+        self.tick(bot)
+        for n in range(4):
+            self.owner_says(bot, wx, f'私聊里第{n}句', ticks=2)
+        wx.post('示例群甲', '群里一句', sender='测试群友')
+        self.tick(bot, 3)
+        for runner in bot.runners.values():
+            runner.last_incoming -= 120
+        bot.go('示例群甲')
+        bot.learn_check_at = 0
+        self.tick(bot)
+        self.assertEqual(learned, ['示例好友'])
+        self.assertEqual(bot.runners['示例好友'].unlearned, 0)
+        bot.learn_check_at = 0
+        self.tick(bot)
+        self.assertEqual(learned, ['示例好友'])

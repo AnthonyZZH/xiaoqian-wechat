@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
@@ -85,8 +86,9 @@ class Bot:
         self.runners = {}    # chat -> Runner, kept while switching so each chat keeps its place
         self.relays = []     # (chat, text) the owner asked her to say
         self.drawings = {}   # job id -> (chat, what): pictures being drawn and where they go
-        self.pictures = []   # (chat, image path or None, what): finished, waiting to be sent
+        self.pictures = []   # (chat, image path or None, what, job id): finished, waiting to be sent
         self.gallery_lock = threading.Lock()  # images/index.json: the worker writes, the console reads
+        self.draw_log = deque(maxlen=30)  # what really happened to each drawing, for the console
         self.previews = {}   # chat -> last seen session-list preview, to notice news elsewhere
         self.incoming = ChatQueue()
         self.route_retry = {}
@@ -102,6 +104,9 @@ class Bot:
         from proactive import Initiative
         self.initiative = Initiative(self.data / "initiative.json", settings)
         self.initiative_check_at = 0.0
+        # Memory of every chat, private ones too, is brought up to date on a timer while idle;
+        # the first sweep waits a few minutes after start.
+        self.learn_check_at = time.monotonic() + 300
 
     def emit(self, kind, payload):
         self.events.put((kind, payload))
@@ -291,11 +296,15 @@ class Bot:
                 self.report_retry_at = 0.0
             return
         if self.pictures and (chat is None or chat == current or priority(chat) > 0):
-            target, path, what = self.pictures.pop(0)
+            target, path, what, job_id = self.pictures.pop(0)
             try:
                 self.send_picture(target, path, what)
             except Exception as exc:
+                self.draw_state(job_id, "发送失败", str(exc)[:60])
                 self.emit("error", f"画好的图没发到「{target}」：{exc}")
+            else:
+                if path:
+                    self.draw_state(job_id, "已发出")
             return
         # The open chat's own waiting entry must not hold back what it asked for (single-chat mode).
         if self.relays and (chat is None or chat == current or priority(chat) > 0):
@@ -320,7 +329,7 @@ class Bot:
             return
         # Only when nothing is waiting (single-chat mode keeps its own chat in the queue).
         idle = chat is None or (chat == current and not self.settings["multi_chat"])
-        if not runner.pending and idle and self.open_topic(current):
+        if not runner.pending and idle and (self.open_topic(current) or self.learn_sweep()):
             return
         if not self.settings["multi_chat"] or chat is None:
             if current in excluded and not runner.initialized:
@@ -340,6 +349,29 @@ class Bot:
             self.route_retry[chat] = time.monotonic() + 10
             self.emit("error", f"「{chat}」待办已保留：{exc}")
             return False
+
+    def learn_sweep(self):
+        """Every 10 minutes while idle: update the memory of the one chat, private or group, with the
+        most news, if it has at least `memory_auto_min_new` new messages and was last updated
+        `memory_auto_minutes` or more ago. A chat need not be open; its saved history is enough."""
+        if time.monotonic() < self.learn_check_at or not self.settings["memory_enabled"]:
+            return False
+        self.learn_check_at = time.monotonic() + 600
+        every = float(self.settings.get("memory_auto_minutes", 60)) * 60
+        least = int(self.settings.get("memory_auto_min_new", 6))
+        due = []
+        for chat in list(self.settings["chats"]):
+            runner = self.runner_for(chat)
+            if runner.unlearned >= least and time.time() - runner.learned_at >= every \
+                    and time.monotonic() - runner.last_incoming >= 60:
+                due.append(runner)
+        if not due:
+            return False
+        runner = max(due, key=lambda r: r.unlearned)
+        self.emit("status", f"定时整理「{runner.chat}」的记忆（{runner.unlearned} 条新消息）…")
+        runner.learn(time.monotonic(), timed=True)
+        self.emit("status", f"「{runner.chat}」{runner.learn_note}")
+        return True
 
     def open_topic(self, current):
         """Nothing waiting: if a chat is due for her to speak up on her own, go there and let
@@ -410,33 +442,62 @@ class Bot:
         return {"log": line, "reply": self.owner_send_from(line, wish)}
 
     def group_command(self, text, act=True, sender=""):
-        """Someone in a group addressing her. The owner: blocking, memory and drawing; anyone else:
-        drawing within a daily allowance. Never sends elsewhere or other agent tasks from a group,
+        """Someone other than the owner's private chat: a group member addressing her, or a private
+        contact. The owner in a group gets blocking, memory and drawing; anyone else only drawing,
+        as the console's 画图授权 allows for that chat. Never sends elsewhere or runs other agent tasks,
         since group sender names come from OCR and avatars."""
-        names = [self.runner.name] + [a for a in self.settings.get("aliases") or [] if a]
+        private = self.runner.mode == "private"
         line = " ".join(str(text).replace(" ", " ").split())
-        called = [n for n in names if f"@{n}" in line]
-        if not called:
-            return None
-        for n in called:
-            line = line.replace(f"@{n}", " ")
+        if not private:
+            names = [self.runner.name] + [a for a in self.settings.get("aliases") or [] if a]
+            called = [n for n in names if f"@{n}" in line]
+            if not called:
+                return None
+            for n in called:
+                line = line.replace(f"@{n}", " ")
         line, log = " ".join(line.split()), " ".join(str(text).split())
-        if sender == self.settings["owner"]:
+        if sender == self.settings["owner"] and not private:
             return self.owner_command(line, act, here=self.runner, log=log)
         what = self.draw_wish(line)
-        if what is None or not self.settings.get("draw_for_members", True):
+        if what is None:
             return None
-        if not act:
-            return {"log": log, "reply": None}
-        limit = int(self.settings.get("draw_daily_limit", 3))
-        used = self.draw_quota(sender)
+        return {"log": log, "reply": self.member_draw(what, sender) if act else None}
+
+    def draw_rule(self, chat, mode):
+        """Drawing rights in `chat`: {enabled, who: all|listed, names, limit, unlimited}.
+
+        Set per chat on the console (settings["draw_rights"]); a group without its own rule follows
+        the older global switches, a private contact without one may not draw."""
+        if mode == "group":
+            base = {"enabled": bool(self.settings.get("draw_for_members", True)), "who": "all", "names": [],
+                    "limit": int(self.settings.get("draw_daily_limit", 3)),
+                    "unlimited": list(self.settings.get("draw_unlimited") or [])}
+        else:
+            base = {"enabled": False, "who": "all", "names": [], "limit": int(self.settings.get("draw_daily_limit", 3)),
+                    "unlimited": []}
+        rule = (self.settings.get("draw_rights") or {}).get(chat)
+        return {**base, **rule} if isinstance(rule, dict) else base
+
+    def member_draw(self, what, sender):
+        """A drawing for someone other than the owner, within this chat's rights and daily count."""
+        chat, mode = self.runner.chat, self.runner.mode
+        rule = self.draw_rule(chat, mode)
+        name = f"{sender} " if mode == "group" else ""
+        if not rule["enabled"] or (mode == "group" and rule["who"] == "listed" and sender not in rule["names"]):
+            return f"{name}画图没对你开放哦"
+        if sender in rule["unlimited"]:
+            return name + self.draw(what, self.runner, sender)
+        limit = int(rule["limit"])
+        if limit <= 0:
+            return f"{name}{'群友' if mode == 'group' else ''}画图现在没有名额，找主人开一下"
+        used = self.draw_quota(chat, sender)
         if used >= limit:
-            return {"log": log, "reply": f"{sender} 今天已经画了 {used} 张啦，明天再来"}
-        reply = self.draw(what, self.runner)
+            return f"{name}今天已经画了 {used} 张啦，明天再来"
+        reply = self.draw(what, self.runner, sender)
         if reply.startswith("好"):
-            self.draw_quota(sender, add=True)
-            reply = f"{sender} {reply}（今天还能画 {limit - used - 1} 张）"
-        return {"log": log, "reply": reply}
+            self.draw_quota(chat, sender, add=True)
+            reply += f"（今天还能画 {limit - used - 1} 张）"
+        return name + reply
 
     def draw_wish(self, line):
         """What to draw, or None: "画画好难" is chat; a request needs 帮我画/画：/画一只…."""
@@ -444,24 +505,41 @@ class Bot:
         if not draw or not self.settings["agents_enabled"]:
             return None
         if draw["ask"] or draw["colon"] or re.match(r"[一两几个张幅只条朵位副]", draw["what"]):
-            return draw["what"]
+            # "画个戴帽子的狗" is about 戴帽子的狗; 张/幅 stay ("画张风景照").
+            return re.sub(r"^个\s*(?=\S)", "", draw["what"])
         return None
 
-    def draw_quota(self, sender, add=False):
-        """Pictures `sender` had drawn today (per group member name); `add` counts one more."""
-        path, today = self.data / "draw_quota.json", datetime.now().strftime("%Y-%m-%d")
+    def draw_counts(self):
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads((self.data / "draw_quota.json").read_text(encoding="utf-8"))
         except Exception:
-            data = {}
-        counts = data.get("counts", {}) if data.get("date") == today else {}
+            return {}
+        return dict(data.get("counts", {})) if data.get("date") == datetime.now().strftime("%Y-%m-%d") else {}
+
+    def save_draw_counts(self, counts):
+        path = self.data / "draw_quota.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(".tmp")
+        temp.write_text(json.dumps({"date": datetime.now().strftime("%Y-%m-%d"), "counts": counts},
+                                  ensure_ascii=False), encoding="utf-8")
+        temp.replace(path)
+
+    def draw_usage(self, chat):
+        """Pictures each person had drawn today in `chat` (the console shows it)."""
+        prefix = f"{chat}|"
+        return {key[len(prefix):]: n for key, n in self.draw_counts().items() if key.startswith(prefix)}
+
+    def reset_draw_usage(self, chat):
+        prefix = f"{chat}|"
+        self.save_draw_counts({k: n for k, n in self.draw_counts().items() if not k.startswith(prefix)})
+
+    def draw_quota(self, chat, sender, add=False):
+        """Pictures `sender` had drawn today in `chat`; `add` counts one more."""
+        counts, key = self.draw_counts(), f"{chat}|{sender}"
         if add:
-            counts[sender] = counts.get(sender, 0) + 1
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temp = path.with_suffix(".tmp")
-            temp.write_text(json.dumps({"date": today, "counts": counts}, ensure_ascii=False), encoding="utf-8")
-            temp.replace(path)
-        return counts.get(sender, 0)
+            counts[key] = counts.get(key, 0) + 1
+            self.save_draw_counts(counts)
+        return counts.get(key, 0)
 
     def owner_command(self, line, act, here=None, log=None):
         """拉黑 / 解除拉黑 / 黑名单 / 总结记忆. `here`: the group it was said in, else the owner's chat."""
@@ -512,7 +590,7 @@ class Bot:
             return self.dispatch("codex", task)
         return None
 
-    def draw(self, what, here=None):
+    def draw(self, what, here=None, who="主人"):
         """Hand a picture to Codex's image tool; it is sent to `here` (a group) or the owner when done."""
         import agents
         chat = here.chat if here else self.settings["owner"]
@@ -525,8 +603,34 @@ class Bot:
         except Exception as exc:
             return f"没法画：{exc}"
         self.drawings[job_id] = (chat, what)
+        with self.gallery_lock:
+            self.draw_log.appendleft({"id": job_id, "who": who, "chat": chat, "what": what,
+                                      "state": "画图中", "started": time.time(), "ended": None, "note": ""})
         self.emit("status", f"开始画：{what[:40]}")
         return "好，画好了发出来，大概要一分钟"
+
+    def draw_state(self, job_id, state, note=None):
+        with self.gallery_lock:
+            for entry in self.draw_log:
+                if entry["id"] == job_id:
+                    entry["state"] = state
+                    entry["ended"] = entry["ended"] or time.time()
+                    if note is not None:
+                        entry["note"] = note
+
+    @staticmethod
+    def draw_reason(job):
+        """Why a drawing failed, in Codex's own last words (a refusal, NO_IMAGE_TOOL, a timeout)."""
+        if job.status != "done":
+            return JOB_STATES.get(job.status, job.status)
+        last = [line.strip() for line in str(job.tail).splitlines() if line.strip()]
+        return last[-1][:80] if last else "没有输出"
+
+    def draw_jobs(self):
+        """Recent drawings, newest first, with seconds so far for the ones still being drawn."""
+        now = time.time()
+        with self.gallery_lock:
+            return [dict(e, seconds=int((e["ended"] or now) - e["started"])) for e in self.draw_log]
 
     def draw_folder(self):
         """Where finished drawings are kept (shown on the console's 画图 page)."""
@@ -767,7 +871,9 @@ class Bot:
                 path = self.drawn(job)
                 if path:
                     self.note_drawing(path, what, chat)
-                self.pictures.append((chat, path, what))
+                self.draw_state(job.id, "画好了，等着发出去" if path else "没画出来",
+                                path.name if path else self.draw_reason(job))
+                self.pictures.append((chat, path, what, job.id))
                 continue
             self.reports.append(self.report(job))
             self.emit("status", f"{self.job_label(job)}{JOB_STATES.get(job.status, job.status)}，汇报会发到主人私聊")
@@ -942,7 +1048,7 @@ class App:
         self.bot, self.settings, self.personas = bot, bot.settings, bot.personas
         self.window = tk.Tk()
         self.window.title("AI 群友控制台")
-        self.window.geometry("760x620")
+        self.window.geometry("800x760")
         self.window.option_add("*Font", (FONT, 10))
         self.status = tk.StringVar(value="已暂停")
         self.header = tk.StringVar()
@@ -1119,6 +1225,8 @@ class App:
             self.chat_list.delete(0, "end")
             for name, info in chats.items():
                 self.chat_list.insert("end", f"{name}    （{'群聊' if info['mode'] == 'group' else '私聊'}）")
+        if hasattr(self, "draw_chat"):
+            self.fill_draw_chats()
 
     def add_chat(self):
         name = self.new_chat.get().strip()
@@ -1466,9 +1574,44 @@ class App:
 
     # ---- 画图 ----
     def build_gallery(self, frame):
-        ttk.Label(frame, wraplength=700, text=(
-            "她画的图（主人或群友让她画、由 Codex 生成）都存在下面这个文件夹。选中一张可以预览、打开、复制路径或删除；"
-            "删除只删电脑上的文件，已经发到微信里的不受影响。")).pack(anchor="w")
+        rights = ttk.LabelFrame(frame, text="画图授权（按聊天分别设置；主人永远不限）", padding=8)
+        rights.pack(fill="x", pady=(0, 8))
+        row = ttk.Frame(rights)
+        row.pack(fill="x")
+        ttk.Label(row, text="聊天：").pack(side="left")
+        self.draw_chat = ttk.Combobox(row, state="readonly", width=18)
+        self.draw_chat.pack(side="left")
+        self.draw_chat.bind("<<ComboboxSelected>>", lambda e: self.load_draw_rule())
+        self.draw_enabled = tk.BooleanVar()
+        ttk.Checkbutton(row, text="允许画图，每人每天", variable=self.draw_enabled).pack(side="left", padx=(10, 0))
+        self.draw_limit = ttk.Spinbox(row, from_=0, to=50, increment=1, width=4)
+        self.draw_limit.pack(side="left", padx=4)
+        ttk.Label(row, text="张").pack(side="left")
+        row = ttk.Frame(rights)
+        row.pack(fill="x", pady=4)
+        self.draw_who = tk.StringVar(value="all")
+        self.draw_who_all = ttk.Radiobutton(row, text="群里所有人", value="all", variable=self.draw_who)
+        self.draw_who_all.pack(side="left")
+        self.draw_who_listed = ttk.Radiobutton(row, text="只限这些人：", value="listed", variable=self.draw_who)
+        self.draw_who_listed.pack(side="left", padx=(8, 0))
+        self.draw_names = ttk.Entry(row)
+        self.draw_names.pack(side="left", fill="x", expand=True)
+        row = ttk.Frame(rights)
+        row.pack(fill="x")
+        ttk.Label(row, text="不限次数的人（逗号分隔，和群里显示的名字一致）：").pack(side="left")
+        self.draw_unlimited = ttk.Entry(row)
+        self.draw_unlimited.pack(side="left", fill="x", expand=True)
+        row = ttk.Frame(rights)
+        row.pack(fill="x", pady=(4, 0))
+        self.draw_used = tk.StringVar()
+        ttk.Label(row, textvariable=self.draw_used).pack(side="left")
+        ttk.Button(row, text="保存这个聊天", command=self.save_draw_rights).pack(side="right")
+        ttk.Button(row, text="清零今天的次数", command=self.reset_draw_usage).pack(side="right", padx=6)
+        self.fill_draw_chats()
+        ttk.Label(frame, text="画图任务（程序这边的真实状态，每 2 秒刷新）：").pack(anchor="w")
+        self.draw_tasks = tk.Listbox(frame, height=4, exportselection=False)
+        self.draw_tasks.pack(fill="x")
+        self.draw_tasks_seen, self.draw_done_seen = None, 0
         where = ttk.Frame(frame)
         where.pack(fill="x", pady=6)
         ttk.Label(where, text="保存位置：").pack(side="left")
@@ -1492,8 +1635,109 @@ class App:
         ttk.Button(bar, text="删除选中", command=self.delete_drawings).pack(side="right")
         self.gallery_items = []
         self.show_gallery()
+        self.window.after(500, self.show_draw_tasks)
+
+    def show_draw_tasks(self):
+        try:
+            jobs = self.bot.draw_jobs()
+            rows = []
+            for job in jobs:
+                when = datetime.fromtimestamp(job["started"]).strftime("%H:%M")
+                took = f"{job['seconds']} 秒"
+                note = f"：{job['note']}" if job["note"] else ""
+                rows.append(f"{when}  {job['who']} → 「{job['chat']}」  {job['what'][:20]}  ·  {job['state']}（{took}）{note}")
+            if not rows:
+                rows = ["（这次启动后还没有画图任务）"]
+            if rows != self.draw_tasks_seen:
+                self.draw_tasks.delete(0, "end")
+                for row in rows:
+                    self.draw_tasks.insert("end", row)
+                self.draw_tasks_seen = rows
+            done = sum(job["state"] != "画图中" for job in jobs)
+            if done != self.draw_done_seen:
+                self.draw_done_seen = done
+                self.show_gallery()
+        except Exception:
+            pass
+        self.window.after(2000, self.show_draw_tasks)
+
+    def fill_draw_chats(self):
+        owner = self.settings["owner"]
+        chats = [c for c in self.settings["chats"] if c != owner]
+        self.draw_chat["values"] = chats
+        if chats and self.draw_chat.get() not in chats:
+            self.draw_chat.set(chats[0])
+        elif not chats:
+            self.draw_chat.set("")
+        self.load_draw_rule()
+
+    def draw_chat_mode(self):
+        chat = self.draw_chat.get()
+        return chat, self.settings.chat_mode(chat) or "private"
+
+    def load_draw_rule(self):
+        chat, mode = self.draw_chat_mode()
+        rule = self.bot.draw_rule(chat, mode) if chat else self.bot.draw_rule("", "private")
+        self.draw_enabled.set(rule["enabled"])
+        self.draw_limit.set(rule["limit"])
+        self.draw_who.set(rule["who"])
+        for entry, names in ((self.draw_names, rule["names"]), (self.draw_unlimited, rule["unlimited"])):
+            entry.configure(state="normal")
+            entry.delete(0, "end")
+            entry.insert(0, "，".join(names))
+        group = mode == "group"
+        for widget in (self.draw_who_all, self.draw_who_listed, self.draw_names, self.draw_unlimited):
+            widget.configure(state="normal" if group else "disabled")
+        self.show_draw_usage()
+
+    def show_draw_usage(self):
+        chat = self.draw_chat.get()
+        if not chat:
+            self.draw_used.set("先在“聊天”页把群或私聊加进允许列表")
+            return
+        used = self.bot.draw_usage(chat)
+        self.draw_used.set(f"「{chat}」今天已画：" + ("、".join(f"{n} {c} 张" for n, c in used.items()) if used else "还没有人画过"))
+
+    def save_draw_rights(self):
+        import re
+        chat, mode = self.draw_chat_mode()
+        if not chat:
+            self.status.set("先选一个聊天")
+            return
+        try:
+            limit = int(self.draw_limit.get())
+        except ValueError:
+            messagebox.showerror("画图授权", "每天张数要填数字")
+            return
+        if not 0 <= limit <= 50:
+            messagebox.showerror("画图授权", "每天张数在 0～50 之间")
+            return
+        split = lambda entry: list(dict.fromkeys(
+            n.strip().lstrip("@") for n in re.split(r"[,，、\s]+", entry.get()) if n.strip()))
+        group = mode == "group"
+        rule = {"enabled": self.draw_enabled.get(), "limit": limit,
+                "who": self.draw_who.get() if group else "all",
+                "names": split(self.draw_names) if group else [],
+                "unlimited": split(self.draw_unlimited) if group else []}
+        rights = dict(self.settings.get("draw_rights") or {})
+        rights[chat] = rule
+        self.settings.update(draw_rights=rights)
+        if not rule["enabled"]:
+            told = "不能画图"
+        elif group and rule["who"] == "listed":
+            told = f"只有 {'、'.join(rule['names']) or '（名单为空）'} 能画，每人每天 {limit} 张"
+        else:
+            told = f"每人每天 {limit} 张" if group else f"每天 {limit} 张"
+        self.status.set(f"已保存「{chat}」：{told}")
+
+    def reset_draw_usage(self):
+        chat = self.draw_chat.get()
+        if chat and messagebox.askyesno("清零次数", f"把「{chat}」今天已经画的次数清零？"):
+            self.bot.reset_draw_usage(chat)
+            self.show_draw_usage()
 
     def show_gallery(self):
+        self.show_draw_usage()
         self.gallery_dir.set(str(self.bot.draw_folder()))
         self.gallery_items = self.bot.drawings_list()
         self.gallery_list.delete(0, "end")

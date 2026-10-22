@@ -582,6 +582,58 @@ class GalleryTests(Temp):
             app.window.destroy()
 
 
+class DrawRightsTests(Temp):
+    def test_console_sets_drawing_rights_per_chat(self):
+        from app import App, Bot
+        settings = Settings(self.dir / 's.json')
+        settings.update(owner='主人', chats={'主人': {'mode': 'private'}, '示例群甲': {'mode': 'group'},
+                                           '示例联系人': {'mode': 'private'}})
+        bot = Bot(settings, PersonaStore(self.dir / 'p'), False, log_dir=self.dir / 'logs', data_dir=self.dir / 'data')
+        bot.draw_quota('示例群甲', '测试群友', add=True)
+        app = App(bot)
+        app.window.withdraw()
+        try:
+            self.assertEqual(list(app.draw_chat['values']), ['示例群甲', '示例联系人'])
+            self.assertEqual(app.draw_used.get(), '「示例群甲」今天已画：测试群友 1 张')
+            app.draw_enabled.set(True)
+            app.draw_limit.set(5)
+            app.draw_who.set('listed')
+            app.draw_names.delete(0, 'end')
+            app.draw_names.insert(0, '@测试群友，momo 、测试群友')
+            app.draw_unlimited.delete(0, 'end')
+            app.draw_unlimited.insert(0, 'momo')
+            app.save_draw_rights()
+            self.assertEqual(bot.settings['draw_rights']['示例群甲'],
+                             {'enabled': True, 'limit': 5, 'who': 'listed',
+                              'names': ['测试群友', 'momo'], 'unlimited': ['momo']})
+            app.draw_chat.set('示例联系人')
+            app.load_draw_rule()
+            self.assertFalse(app.draw_enabled.get())
+            self.assertEqual(str(app.draw_names['state']), 'disabled')
+            app.draw_enabled.set(True)
+            app.draw_limit.set(2)
+            app.save_draw_rights()
+            self.assertEqual(bot.settings['draw_rights']['示例联系人'],
+                             {'enabled': True, 'limit': 2, 'who': 'all', 'names': [], 'unlimited': []})
+            app.draw_chat.set('示例群甲')
+            app.load_draw_rule()
+            self.assertEqual(app.draw_names.get(), '测试群友，momo')
+            with mock.patch('app.messagebox.askyesno', return_value=True):
+                app.reset_draw_usage()
+            self.assertEqual(app.draw_used.get(), '「示例群甲」今天已画：还没有人画过')
+
+            settings.update(chats={'主人': {'mode': 'private'}, '示例群乙': {'mode': 'group'}})
+            app.fill_chats()
+            self.assertEqual(list(app.draw_chat['values']), ['示例群乙'])
+            self.assertEqual(app.draw_chat.get(), '示例群乙')
+            settings.update(chats={'主人': {'mode': 'private'}})
+            app.fill_chats()
+            self.assertEqual(list(app.draw_chat['values']), [])
+            self.assertEqual(app.draw_chat.get(), '')
+        finally:
+            app.window.destroy()
+
+
 class LMStudioTests(unittest.TestCase):
     def setUp(self):
         patcher = mock.patch.object(lmstudio, 'release_memory', return_value=0)

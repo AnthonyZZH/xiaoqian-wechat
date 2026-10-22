@@ -2,6 +2,12 @@
 
 Each update to this repository is tagged as a small version (`v0.1`, `v0.2`, …).
 
+## v0.7
+
+- Drawing rights are set per allowed chat in the console: enable or disable drawing, choose everyone or a name list in groups, set a daily limit and unlimited names, and reset today's counts. Private contacts are disabled until explicitly allowed; the owner remains unlimited.
+- The 画图 tab shows each job's real state and elapsed time, refreshes automatically, and keeps its chat selector synchronized when the allowed-chat list changes.
+- Memory progress is saved beside each chat history and restored after restart. While idle, the bot periodically brings the allowed chat with the most new messages up to date, including private chats that are not currently open.
+
 ## v0.6
 
 - Hand-off: in the owner's chat the reply schema has `handoff {kind: none|draw|codex, task}`. Real work mentioned in passing goes to the draw agent or Codex and she replies with the receipt; the local agent still runs only when named. Group chats never hand off.

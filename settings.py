@@ -52,6 +52,9 @@ DEFAULTS = {
     "aliases": [],
     "memory_enabled": True,
     "memory_every": 12,  # new messages between memory updates
+    # Timed updates for every chat, private ones too: at most this often, once this many are new.
+    "memory_auto_minutes": 60,
+    "memory_auto_min_new": 6,
     # The owner's private chat can hand tasks to local command-line agents (agents.py).
     "agents_enabled": True,
     "agent_passphrase": "",  # empty: no passphrase needed
@@ -61,6 +64,9 @@ DEFAULTS = {
     # Drawing (Codex's image tool): group members who @ her get this many pictures a day; the owner has no limit.
     "draw_for_members": True,
     "draw_daily_limit": 3,
+    "draw_unlimited": [],  # group member names with no daily limit
+    # Per chat, set on the console: {chat: {"enabled", "who": "all"|"listed", "names", "limit", "unlimited"}}.
+    "draw_rights": {},
 }
 
 
