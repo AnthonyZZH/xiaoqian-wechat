@@ -93,6 +93,10 @@ class Bot:
         self.reports = []
         self.report_retry_at = 0.0
         self.agents = AgentJobs(default_configs(), self.data / "agent_logs", self.finished.put)
+        # When she may open a topic on her own (group bubbles, a message to the owner).
+        from proactive import Initiative
+        self.initiative = Initiative(self.data / "initiative.json", settings)
+        self.initiative_check_at = 0.0
 
     def emit(self, kind, payload):
         self.events.put((kind, payload))
@@ -130,6 +134,9 @@ class Bot:
             runner.should_yield = lambda r=runner: self.higher_priority(r)
             runner.agent_command = self.agent_command
             runner.group_command = self.group_command
+            runner.on_heard = lambda r=runner: self.initiative.heard(r.chat, r.mode)
+            runner.on_spoke = lambda opening, r=runner: self.initiative.spoke(r.chat, r.mode, opening)
+            runner.on_declined = lambda r=runner: self.initiative.declined(r.chat, r.mode)
             runner.context = lambda: "\n".join(
                 r.digest() for c, r in self.runners.items() if c in groups() and r.digest())
             self.runners[chat] = runner
@@ -281,6 +288,10 @@ class Bot:
                     note = f"（群成员里没找到 {'、'.join(missing)}，按文字写的 @）" if missing else ""
                     self.reports.append(f"已发给「{target}」：{shown[:60] + '…' if len(shown) > 60 else shown}{note}")
             return
+        # Only when nothing is waiting (single-chat mode keeps its own chat in the queue).
+        idle = chat is None or (chat == current and not self.settings["multi_chat"])
+        if not runner.pending and idle and self.open_topic(current):
+            return
         if not self.settings["multi_chat"] or chat is None:
             if current in excluded and not runner.initialized:
                 return False
@@ -299,6 +310,29 @@ class Bot:
             self.route_retry[chat] = time.monotonic() + 10
             self.emit("error", f"「{chat}」待办已保留：{exc}")
             return False
+
+    def open_topic(self, current):
+        """Nothing waiting: if a chat is due for her to speak up on her own, go there and let
+        the next step() ask the model, which may still decide there is nothing worth saying."""
+        if time.monotonic() < self.initiative_check_at:
+            return False
+        self.initiative_check_at = time.monotonic() + 15
+        chats = self.settings["chats"]
+        due = [c for c in self.initiative.due(chats) if c in chats and (self.settings["multi_chat"] or c == current)]
+        if not due:
+            return False
+        target = due[0]
+        try:
+            if target != current:
+                self.go(target)
+            if not self.runner.initialized or self.runner.active_epoch != self.enabled.epoch:
+                self.runner.prime(self.adapter.read(), replay=True)  # an anchor only: nothing old is answered
+            self.runner.opening = self.initiative.describe(target)
+        except Exception as exc:
+            self.initiative.declined(target, chats[target]["mode"])
+            self.emit("error", f"想去「{target}」冒个泡，没切过去：{exc}")
+            return False
+        return True
 
     def cycle(self):
         if self.watch() is False:
@@ -1345,6 +1379,20 @@ class App:
         self.quiet_end.insert(0, str(end))
         self.quiet_start.grid(row=n + 2, column=1, sticky="w", padx=8)
         self.quiet_end.grid(row=n + 2, column=2, sticky="w")
+        self.initiative_private = tk.BooleanVar(value=self.settings["initiative_private"])
+        ttk.Checkbutton(frame, text="主动私聊主人", variable=self.initiative_private).grid(
+            row=n + 3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(frame, text="主动私聊免打扰（如 1-8、23-7）").grid(row=n + 4, column=0, sticky="w")
+        self.initiative_private_quiet = ttk.Entry(frame, width=10)
+        self.initiative_private_quiet.insert(0, self.settings["initiative_quiet_hours"]["private"])
+        self.initiative_private_quiet.grid(row=n + 4, column=1, sticky="w", padx=8)
+        self.initiative_group = tk.BooleanVar(value=self.settings["initiative_group"])
+        ttk.Checkbutton(frame, text="群里冒泡", variable=self.initiative_group).grid(
+            row=n + 5, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        ttk.Label(frame, text="群聊冒泡免打扰（如 1-8、23-7）").grid(row=n + 6, column=0, sticky="w")
+        self.initiative_group_quiet = ttk.Entry(frame, width=10)
+        self.initiative_group_quiet.insert(0, self.settings["initiative_quiet_hours"]["group"])
+        self.initiative_group_quiet.grid(row=n + 6, column=1, sticky="w", padx=8)
         self.abilities = {}
         for i, (key, label) in enumerate([
                 ("describe_images", "看懂对方发来的表情包和图片（本地视觉模型）"),
@@ -1353,9 +1401,9 @@ class App:
                 ("collect_stickers", "收集别人发的表情包，放到“表情包”页待挑选"),
                 ("memory_enabled", "长期记忆：记住每个人和这里的黑话")]):
             var = tk.BooleanVar(value=self.settings[key])
-            ttk.Checkbutton(frame, text=label, variable=var).grid(row=n + 3 + i, column=0, columnspan=3, sticky="w")
+            ttk.Checkbutton(frame, text=label, variable=var).grid(row=n + 7 + i, column=0, columnspan=3, sticky="w")
             self.abilities[key] = var
-        ttk.Button(frame, text="保存（立即生效）", command=self.save_rhythm).grid(row=n + 8, column=0, sticky="w", pady=14)
+        ttk.Button(frame, text="保存（立即生效）", command=self.save_rhythm).grid(row=n + 12, column=0, sticky="w", pady=14)
 
     def save_rhythm(self):
         try:
@@ -1366,12 +1414,22 @@ class App:
             start, end = int(self.quiet_start.get()), int(self.quiet_end.get())
             if not 0 < low <= high or not (0 <= start <= 23 and 0 <= end <= 23):
                 raise ValueError("主动等待需 0 < 最少 ≤ 最多；时段为 0~23 点")
+            initiative_quiet = {}
+            for mode, entry in (("private", self.initiative_private_quiet),
+                                ("group", self.initiative_group_quiet)):
+                match = re.fullmatch(r"\s*(\d{1,2})\s*-\s*(\d{1,2})\s*", entry.get())
+                if not match or any(not 0 <= int(hour) <= 23 for hour in match.groups()):
+                    raise ValueError("主动开话题的免打扰时段请写成 1-8 或 23-7")
+                initiative_quiet[mode] = f"{int(match.group(1))}-{int(match.group(2))}"
         except ValueError as exc:
             messagebox.showerror("保存失败", str(exc) if "请" in str(exc) or "需" in str(exc) else "请填写整数")
             return
         self.settings.update(**values, **{k: v.get() for k, v in self.abilities.items()},
                              proactive=self.proactive.get(),
-                             proactive_after_seconds=[low, high], quiet_hours=[start, end])
+                             proactive_after_seconds=[low, high], quiet_hours=[start, end],
+                             initiative_private=self.initiative_private.get(),
+                             initiative_group=self.initiative_group.get(),
+                             initiative_quiet_hours=initiative_quiet)
         self.status.set("节奏设置已保存")
 
     # ---- events ----

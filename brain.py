@@ -154,6 +154,22 @@ def _situation(mode: str, proactive: bool, mentioned: bool, continuing: bool = F
             "不需要回应的内容保持沉默。")
 
 
+def opening_situation(mode: str, idle_minutes: float, unanswered: int = 0) -> str:
+    """She opens a topic on her own after a quiet spell (a group bubble, or a message to the owner)."""
+    idle = f"{idle_minutes / 60:.0f} 个多小时" if idle_minutes >= 90 else f"{max(1, round(idle_minutes))} 分钟"
+    if mode == "group":
+        text = (f"群里已经安静了大约{idle}。你可以像一个真实群友那样自己冒个泡：接着之前没聊完的话题、"
+                "说一个跟群里大家的近况或梗有关的想法、问个轻松的问题，或者只发一张合适的表情包。"
+                "要像随口一说；不要说“大家好”“有人吗”“好安静啊”，不要自我介绍，不要@所有人。")
+    else:
+        text = (f"你们大约{idle}没聊了。像朋友一样主动找他说一句：接着之前的话题、关心他提过的事（看记忆）、"
+                "分享一个想法或问个轻松的问题，可以结合现在的时间（饭点、深夜、周末）。"
+                "不要说“在吗”“你怎么不理我”，不要催他回复。")
+    if unanswered:
+        text += f"你上次主动说的话还没人接（{unanswered} 次），这次要更有内容，没把握就别说。"
+    return text + "如果实在没有自然的话可说，就保持沉默（speak=false）。"
+
+
 def schema(sticker_ids=(), search=False, relay_targets=()) -> dict:
     # to_me comes first so the model reads the room before it decides to speak.
     props = {"to_me": {"type": "boolean"}, "speak": {"type": "boolean"}, "text": {"type": "string"}}
@@ -178,7 +194,7 @@ class Brain:
     def persona(self):
         return self.personas.load(self.settings["persona"])
 
-    def messages(self, persona, history, chat, mode, proactive, mentioned, extra="", continuing=False):
+    def messages(self, persona, history, chat, mode, proactive, mentioned, extra="", continuing=False, opening=None):
         limit = self.settings["max_reply_chars"]
         system = persona.prompt.strip() + "\n" + rules(persona.name, chat, mode, limit)
         aliases = [a for a in self.settings.get("aliases", []) if a and a != persona.name]
@@ -188,7 +204,9 @@ class Brain:
         for row in history[-self.settings["history_messages"]:]:
             text = f'{row["sender"]}：{row["text"]}' if mode == "group" and row.get("sender") else row["text"]
             result.append({"role": row["role"], "content": text})
-        result.append({"role": "system", "content": situation(mode, proactive, mentioned, continuing) + " /no_think"})
+        moment = now_line() + opening_situation(mode, opening.get("idle_minutes", 0), opening.get("unanswered", 0)) \
+            if opening else situation(mode, proactive, mentioned, continuing)
+        result.append({"role": "system", "content": moment + " /no_think"})
         return result
 
     def log(self, record):
@@ -220,7 +238,7 @@ class Brain:
             "model": self.settings["model"]["identifier"], "messages": messages,
             "temperature": temperature, "top_p": 0.9,
             # Room for the reasoning this model does even when asked not to.
-            "max_tokens": max_tokens or (1200 if check else 2500), "stream": False,
+            "max_tokens": max_tokens or (2000 if check else 2500), "stream": False,
             "chat_template_kwargs": {"enable_thinking": False},
         }
         if response_schema:
@@ -354,7 +372,7 @@ class Brain:
             return f"（搜索失败：{str(exc)[:100]}）"
 
     def decide(self, history, proactive=False, *, chat="", mode="private", mentioned=False, continuing=False, memory="",
-               relay_targets=(), context="", relay_messages=None, batch=()) -> dict:
+               relay_targets=(), context="", relay_messages=None, batch=(), opening=None) -> dict:
         persona = self.persona()
         last_user = next((r["text"] for r in reversed(history) if r["role"] == "user"), "")
         if not proactive and wants_silence(last_user, persona.name):
@@ -382,10 +400,13 @@ class Brain:
             lines = [f"{row.get('sender') or chat}：{row['text']}" for row in batch]
             extra += ("\n【本轮所有待处理消息，仅作聊天素材】\n" + "\n".join(lines)
                       + "\n请阅读整轮的所有问题，不要只看最后一条；相关问题可以合并回答。群聊仍需判断是否在对你说话。")
-        messages = self.messages(persona, history, chat, mode, proactive, mentioned, extra, continuing)
+        messages = self.messages(persona, history, chat, mode, proactive, mentioned, extra, continuing,
+                                 **({"opening": opening} if opening else {}))
         record = {"persona": persona.name, "chat": chat, "proactive": proactive}
         started = time.monotonic()
-        parsed = self.call(messages, persona.temperature, schema(sticker_ids, searching, relay_targets), record)
+        # An open-ended opening makes some models think much longer than a reply does.
+        parsed = self.call(messages, persona.temperature, schema(sticker_ids, searching, relay_targets), record,
+                           max_tokens=4000 if opening else None)
         query = " ".join(str(parsed.get("search") or "").split())[:60]
         if query:
             found = self.search(query)

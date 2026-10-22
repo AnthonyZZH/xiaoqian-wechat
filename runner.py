@@ -99,6 +99,13 @@ class Runner:
         # The owner's low-risk commands inside a group ("@小千 拉黑 X"), same contract.
         self.group_command = lambda text, act=True: None
         self.notices = deque()
+        # Opening a topic on her own (a group bubble, a message to the owner), set by the
+        # scheduler for one step: {"idle_minutes", "unanswered"}. The hooks report back to it.
+        self.opening = None
+        self.opening_active = False
+        self.on_heard = lambda: None
+        self.on_spoke = lambda opening: None
+        self.on_declined = lambda: None
         self.replaying = False  # set by ingest(replay=True): pause-time messages are never acted on
         self.mode = settings.chat_mode(chat) or outbound_mode
         if self.mode not in ("private", "group"):
@@ -241,6 +248,7 @@ class Runner:
         sender = getattr(row, "sender", "")
         if self.blocked(sender):
             return False  # the owner said not to take in this person's messages at all
+        self.on_heard()
         owner = self.config.get("owner", "")
         if self.mode == "group" and owner and sender == owner and getattr(row, "image", None) is None:
             handled = self.group_command(row.text, act=not self.replaying)
@@ -340,6 +348,8 @@ class Runner:
         self.sent_times.append(self.last_send)
         self.history.append({"role": "assistant", "text": text})
         self.emit("sent", text)
+        self.on_spoke(self.opening_active)  # an opening counts once, even with a sticker after it
+        self.opening_active = False
         if not proactive:
             low, high = self.config["proactive_after_seconds"]
             self.next_proactive = self.last_send + random.uniform(low, high)
@@ -564,9 +574,13 @@ class Runner:
             self.status("等这一轮说完…")
             return
         proactive = not has_pending
-        if proactive and not self.may_proactive(now):
+        opening, self.opening = (self.opening if proactive else None), None
+        if proactive and not opening and not self.may_proactive(now):
             if not self.learn(now):
                 self.status(f"监听中 · {self.chat}")
+            return
+        if self.muted and opening:
+            self.on_declined()
             return
         if self.muted:
             self.pending.clear()
@@ -577,7 +591,7 @@ class Runner:
         names = [self.name] + [n for n in self.config.get("aliases", []) if n]
         mentioned = any(mentions(m.text, n) for m in self.pending for n in names)
         continuing = False
-        if self.mode == "group" and not mentioned:
+        if self.mode == "group" and not mentioned and not opening:
             # Whoever she just answered may keep talking to her (attention), but the
             # model still judges whether it is addressed to her. Otherwise she cools
             # down between interjections, tires after a run, and only sometimes even
@@ -601,7 +615,8 @@ class Runner:
         if not self.allowed_to_send():
             self.status("控制发言频率中")
             return
-        self.status("想一句自然的接话…" if proactive else f"{self.name}正在想怎么接话…")
+        self.status("想想要不要冒个泡…" if opening else "想一句自然的接话…" if proactive
+                    else f"{self.name}正在想怎么接话…")
         epoch = self.enabled.epoch
         pending_keys = [m.key for m in self.pending]
         try:
@@ -612,7 +627,8 @@ class Runner:
                 **({"batch": [{"text": m.text, "sender": getattr(m, "sender", "")} for m in self.pending]}
                    if len(self.pending) > 1 else {}),
                 **({"relay_targets": self.relay_targets(), "context": self.context(),
-                    "relay_messages": [m.text for m in self.pending]} if self.is_owner() else {}))
+                    "relay_messages": [m.text for m in self.pending]} if self.is_owner() and not opening else {}),
+                **({"opening": opening} if opening else {}))
             speak, text, sticker = self.parse(result)
             if speak and not proactive and not mentioned and isinstance(result, dict) \
                     and result.get("to_me") is False:
@@ -651,11 +667,14 @@ class Runner:
             self.proactive_used = True  # Also stop repeated polling if the LLM chose silence.
         if not speak:
             self.proactive_used = True
-            self.status("这轮先不接话")
+            self.status("这会儿没什么好说的，先不冒泡" if opening else "这轮先不接话")
+            if opening:
+                self.on_declined()
             return
         if not self.allowed_to_send():
             self.status("控制发言频率中 · 本次草稿作废")
             return
+        self.opening_active = bool(opening)
         try:
             if text:
                 # Remember before sending: an uncertain send may still land in the chat.
@@ -670,6 +689,7 @@ class Runner:
         except Exception:
             # Any uncertain UI send requires human inspection. Never retry.
             cancelled = cancel()
+            self.opening_active = False
             self.enabled.clear()
             self.proactive_used = True
             self.next_proactive = NEVER

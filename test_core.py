@@ -30,6 +30,9 @@ class SettingsTests(Temp):
         self.assertEqual(settings['batch_seconds'], 6)
         self.assertEqual(settings['model']['key'], 'your-local-model')
         self.assertEqual(settings['sticker_every'], 2)
+        self.assertTrue(settings['initiative_private'])
+        self.assertTrue(settings['initiative_group'])
+        self.assertEqual(settings['initiative_quiet_hours'], {'private': '1-8', 'group': '1-8'})
         self.assertIsNone(settings.chat_mode('别人'))
 
     def test_update_persists(self):
@@ -525,6 +528,29 @@ class StickerDescTests(Temp):
             app.sticker_desc.insert(0, '新描述')
             app.save_sticker_desc()
             self.assertEqual(dict(bot.stickers.catalog()), {'狗头': '新描述'})
+        finally:
+            app.window.destroy()
+
+
+class RhythmSettingsTests(Temp):
+    def test_initiative_controls_save_switches_and_quiet_hours(self):
+        from app import App, Bot
+        bot = Bot(Settings(self.dir / 's.json'), PersonaStore(self.dir / 'p'), False,
+                  log_dir=self.dir / 'logs', data_dir=self.dir / 'data')
+        app = App(bot)
+        app.window.withdraw()
+        try:
+            app.initiative_private.set(False)
+            app.initiative_group.set(True)
+            app.initiative_private_quiet.delete(0, 'end')
+            app.initiative_private_quiet.insert(0, '23 - 7')
+            app.initiative_group_quiet.delete(0, 'end')
+            app.initiative_group_quiet.insert(0, '0-6')
+            app.save_rhythm()
+            self.assertFalse(bot.settings['initiative_private'])
+            self.assertTrue(bot.settings['initiative_group'])
+            self.assertEqual(bot.settings['initiative_quiet_hours'],
+                             {'private': '23-7', 'group': '0-6'})
         finally:
             app.window.destroy()
 

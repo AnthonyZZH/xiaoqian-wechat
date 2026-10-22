@@ -2,6 +2,13 @@
 
 Each update to this repository is tagged as a small version (`v0.1`, `v0.2`, …).
 
+## v0.4
+
+- Opening topics on her own (`proactive.py`): a bubble in a group after it has been quiet for a while, and a message to the designated contact every few hours. When a chat is due she is only asked to consider it; the model may stay silent, which reschedules without counting.
+- Pacing per chat with random windows, a group silence threshold, quiet hours (also across midnight), an unanswered limit that resets when someone speaks, and state that survives restarts.
+- Console switches for "message the owner" and "bubble in groups", and quiet hours for each.
+- Replies get a 2000-token budget and openings 4000, so long-thinking local models are not cut off.
+
 ## v0.3
 
 - Real @mentions in groups: the member is picked from WeChat 4.1's mention popover (the approach of pyweixin); members it lacks go out as plain "@name" and are reported.

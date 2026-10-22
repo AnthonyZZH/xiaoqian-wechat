@@ -9,7 +9,7 @@
 ## 功能
 
 - **参与对话**：合并短时间内的连续消息，判断是否在对机器人说话；群聊中按点名、上下文和频率决定是否插话。
-- **主动接话**：私聊在一段时间后可延续话题；群聊主要响应新消息，不会定时主动开话题。
+- **主动接话与开话题**：私聊在一段时间后可延续话题；群里安静一阵后会自己冒个泡，也会隔几个小时主动找主人聊一句。到点时由模型判断有没有值得说的，没有就不说；有免打扰时段，连续没人接就暂停。
 - **可编辑人格**：内置“小千”和“阿温”，支持新增、修改人格。
 - **长期记忆**：按聊天整理人物档案、黑话和聊天风格；可以手动编辑，保存前备份，遇到并发更新时提示冲突。
 - **图片与表情**：视觉模型可描述图片，按描述选择表情；收到的表情可先进入待审核列表。
@@ -60,7 +60,7 @@ py -3.11 -m venv .venv
 ## 测试
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_core test_runner test_memory_edit test_websearch test_routing test_agents test_agent_bridge -v
+.\.venv\Scripts\python.exe -m unittest test_core test_runner test_memory_edit test_websearch test_routing test_agents test_agent_bridge test_proactive -v
 ```
 
 默认测试使用临时数据、模拟微信和模拟模型，不向微信发消息。真实搜索测试仅在 `LIVE_SEARCH=1` 时启用；OCR 测试依赖系统语言组件。测试不会替代当前微信版本的人工收发验证。
@@ -80,6 +80,8 @@ py -3.11 -m venv .venv
 | `settings.py` / `personas.py` | 本地设置与人格 |
 | `lmstudio.py` | LM Studio 模型加载与实例管理 |
 | `inspect_group.py` | 群聊识别的只读校准 |
+| `proactive.py` | 主动开话题的节奏、免打扰与未回复上限 |
+| `agents.py` / `routing.py` | 本机 agent 任务；多聊天调度与转告收件人 |
 | `data/` | 运行时个人数据，始终不提交 |
 
 ## 已知限制
@@ -88,9 +90,16 @@ py -3.11 -m venv .venv
 
 机器人按已配置的聊天权限工作，建议让聊天参与者知晓它是 AI。上传自己的修改前，请检查暂存区，勿提交 `data/`、截图、日志、账号标识或本机配置。
 
-## 版本与贡献者
+## 版本更新
 
-每次更新打一个小版本号，见 [CHANGELOG.md](CHANGELOG.md)。
+每次更新打一个小版本号（git 标签 `v0.x`），完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+- **v0.4**：主动开话题——群里安静一阵后冒个泡，隔几个小时主动私聊主人；到点由模型决定说不说，免打扰时段、未回复上限，状态重启后保留。
+- **v0.3**：群里真正的艾特（从成员列表选人）；不按格式的代发说法由本地模型读出再核对；拉黑、黑名单；“总结记忆”命令，记忆整理不再因模型思考过长而失败；表情包优先、小表情不重复。
+- **v0.2**：主人私聊派任务给本机 agent（Claude Code / Codex / DeepSeek Harness）；“给某某发：…”代发到任意聊天并如实回报；多聊天转告。
+- **v0.1**：首个脱敏发布版：人格、长期记忆、表情包、联网搜索、多聊天照看与控制台。
+
+## 贡献者
 
 - [AnthonyZZH](https://github.com/AnthonyZZH)：维护者
 - [Codex](https://github.com/codex)（OpenAI）：实现、审查与测试

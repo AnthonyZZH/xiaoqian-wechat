@@ -770,3 +770,65 @@ class AgentBridgeTests(Temp):
         self.owner_says(bot, wx, '今天好累')
         self.owner_says(bot, wx, '总结记忆')
         self.assertEqual(wx.sent[-1], ('示例好友', '「示例好友」这次没整理好记忆：模型输出被截断'))
+
+    # ---- speaking up on her own: a group bubble, a message to the owner ----
+    def with_plan(self, bot, due=()):
+        class Plan:
+            def __init__(self):
+                self.due_now, self.calls = list(due), []
+
+            def heard(self, chat, mode, now=None):
+                self.calls.append(('heard', chat))
+
+            def spoke(self, chat, mode, opening, now=None):
+                self.calls.append(('spoke', chat, opening))
+
+            def declined(self, chat, mode, now=None):
+                self.calls.append(('declined', chat))
+
+            def due(self, chats, now=None):
+                ready, self.due_now = self.due_now, []
+                return ready
+
+            def describe(self, chat, now=None):
+                return {'idle_minutes': 75, 'unanswered': 0}
+
+        bot.initiative, bot.initiative_check_at = Plan(), 0.0
+        return bot.initiative
+
+    def test_a_quiet_group_gets_a_bubble(self):
+        bot, wx = self.make([{'speak': True, 'to_me': False, 'text': '你们周末都干嘛去啦'}])
+        self.tick(bot)
+        plan = self.with_plan(bot, ['示例群甲'])
+        self.tick(bot, 2)
+        self.assertEqual(wx.sent, [('示例群甲', '你们周末都干嘛去啦')])
+        self.assertEqual(self.prompts[0]['opening'], {'idle_minutes': 75, 'unanswered': 0})
+        self.assertIn(('spoke', '示例群甲', True), plan.calls)
+
+    def test_she_may_decide_there_is_nothing_to_say(self):
+        bot, wx = self.make([{'speak': False, 'to_me': False, 'text': ''}])
+        self.tick(bot)
+        plan = self.with_plan(bot, ['示例好友'])
+        self.tick(bot, 2)
+        self.assertEqual(wx.sent, [])
+        self.assertEqual(len(self.prompts), 1)
+        self.assertIn(('declined', '示例好友'), plan.calls)
+
+    def test_messages_reach_the_plan_and_come_first(self):
+        bot, wx = self.make([{'speak': True, 'to_me': True, 'text': '来啦'}])
+        self.tick(bot)
+        plan = self.with_plan(bot)
+        wx.post('示例好友', '在干嘛')
+        plan.due_now = ['示例群甲']
+        self.tick(bot, 2)
+        self.assertIn(('heard', '示例好友'), plan.calls)
+        self.assertEqual(wx.sent[0], ('示例好友', '来啦'))
+        self.assertNotIn('opening', self.prompts[0])  # an answer, not an opening
+
+    def test_single_chat_mode_only_speaks_up_where_it_is(self):
+        bot, wx = self.make([{'speak': True, 'to_me': False, 'text': '吃了吗'}], multi=False)
+        self.tick(bot)
+        self.with_plan(bot, ['示例群甲'])
+        self.tick(bot, 2)
+        self.assertEqual(wx.sent, [])
+        self.assertEqual(wx.open, '示例好友')

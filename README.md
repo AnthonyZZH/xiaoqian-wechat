@@ -9,7 +9,7 @@ Supports private chats, group chats, editable long-term memory, and stickers. Th
 ## Features
 
 - **Conversational participation:** batches consecutive messages and checks whether a reply is appropriate. Group participation considers mentions, recent context, and speaking frequency.
-- **Follow-up messages:** can continue private conversations after a delay. Group participation responds to incoming messages rather than opening topics on a timer.
+- **Follow-ups and opening topics:** can continue private conversations after a delay, bubble up in a group that has gone quiet, and message the designated contact every few hours. When a chat is due the model decides whether anything is worth saying; quiet hours apply and she stops after openings nobody answers.
 - **Editable personas:** includes Xiaoqian, a cheerful and mildly sarcastic companion, and Awen, a gentler persona. Create and edit your own in the control panel.
 - **Long-term memory:** stores people, group slang, and conversation style separately for each chat. Manual edits include backups and conflict detection.
 - **Images and stickers:** vision models can describe images and select stickers by their descriptions. Collected stickers enter a review queue.
@@ -83,7 +83,7 @@ See [Data and Privacy](docs/PRIVACY.md), [Usage Guide](docs/USAGE.md), and [Thir
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_core test_runner test_memory_edit test_websearch test_routing test_agents test_agent_bridge -v
+.\.venv\Scripts\python.exe -m unittest test_core test_runner test_memory_edit test_websearch test_routing test_agents test_agent_bridge test_proactive -v
 ```
 
 Default tests use temporary data, simulated WeChat adapters, and mocked model responses. They do not send WeChat messages. The live search smoke test runs only with `LIVE_SEARCH=1`; OCR tests require the appropriate Windows language component. Automated tests do not replace manual verification against your WeChat version.
@@ -103,6 +103,8 @@ Default tests use temporary data, simulated WeChat adapters, and mocked model re
 | `settings.py` / `personas.py` | Local settings and personas |
 | `lmstudio.py` | LM Studio model loading and instance management |
 | `inspect_group.py` | Read-only group recognition calibration |
+| `proactive.py` | Pacing, quiet hours and unanswered limits for opening topics |
+| `agents.py` / `routing.py` | Local agent tasks; multi-chat scheduling and relay recipients |
 | `data/` | Personal runtime data; never commit this directory |
 
 ## Known limitations
@@ -113,9 +115,16 @@ The model loader switches only the bot's own model instance. The working-set tri
 
 Let conversation participants know they are interacting with an AI. Before publishing your own changes, review staged files and exclude personal data, screenshots, logs, credentials, and machine-specific configuration.
 
-## Versions and contributors
+## Version history
 
-Every update is tagged as a small version; see [CHANGELOG.md](CHANGELOG.md).
+Every update is tagged as a small version (`v0.x`); the full notes are in [CHANGELOG.md](CHANGELOG.md).
+
+- **v0.4** — Opening topics on her own: a bubble in a group that has gone quiet, a message to the designated contact every few hours. The model decides whether to speak; quiet hours and unanswered limits apply, and the pacing survives restarts.
+- **v0.3** — Real @mentions picked from the member list; free-worded send requests read by the local model and checked; blocking and a block list; "总结记忆" on request, and memory updates that no longer fail on long-thinking models; stickers before small emoji, no repeats.
+- **v0.2** — Hand tasks to local agents (Claude Code / Codex / DeepSeek Harness) from the designated contact's chat; "给某某发：…" sends to any chat and reports truthfully; multi-chat relays.
+- **v0.1** — First sanitized release: personas, long-term memory, stickers, web search, multi-chat monitoring and the console.
+
+## Contributors
 
 - [AnthonyZZH](https://github.com/AnthonyZZH) — maintainer
 - [Codex](https://github.com/codex) (OpenAI) — implementation, review and testing
