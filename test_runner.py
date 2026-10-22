@@ -115,7 +115,8 @@ class PrivateTests(Base):
     def test_brain_gets_chat_and_mode(self):
         self.add(); self.runner.step()
         self.assertEqual(self.calls[0][2], {'chat': '示例好友', 'mode': 'private', 'mentioned': False, 'continuing': False, 'memory': '',
-                                             'relay_targets': [], 'context': '', 'relay_messages': ['今天不想学习']})
+                                             'relay_targets': [], 'context': '', 'relay_messages': ['今天不想学习'],
+                                             'handoff': True})
 
     def test_outgoing_does_not_trigger_reply(self):
         self.add(role='assistant')

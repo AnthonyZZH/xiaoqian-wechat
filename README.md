@@ -16,7 +16,8 @@ Supports private chats, group chats, editable long-term memory, and stickers. Th
 - **Web search:** DuckDuckGo HTML search with Bing as a fallback.
 - **Multiple chats:** monitors only allowlisted conversations and supports relays from a designated contact's private chat to other allowlisted chats.
 - **Owner sends:** in the designated contact's private chat, "给某某发：…" or "在某群里说：…" sends the text after the colon (whitespace collapsed) to any WeChat chat found by name (short group names are matched only when unambiguous), without the model, and reports back whether it was really sent. @mentions are picked from WeChat's member list like a person would; free wording is read by the local model and then checked.
-- **Drawing:** "画一只橘猫" / "帮我画：…" gets a picture from Codex's image tool, sent back to the chat that asked. Group members who @ her get 3 a day; the owner has no limit.
+- **Drawing:** "画一只橘猫" / "帮我画：…" gets a picture from Codex's image tool, sent back to the chat that asked; asked to follow an online look, fan art or a character, it searches for references first. Group members who @ her get 3 a day; the owner has no limit. The console's 画图 tab shows, opens and deletes past pictures.
+- **Asked means done:** real work the owner mentions in passing (a drawing, research to summarize, a file to make) is handed to the right agent, and she replies with the real receipt instead of promising.
 - **Blocking and memory on command:** "拉黑 X" / "解除拉黑 X" / "黑名单" and "总结记忆", in the private chat or by @-ing her in a group.
 - **Local agent tasks (on by default, can be turned off):** the designated contact's private chat can hand a task to a local command-line agent (Claude Code, Codex or DeepSeek Harness) with an optional passphrase, and gets a one-line report when it finishes. See [docs/USAGE.md](docs/USAGE.md).
 
@@ -120,6 +121,7 @@ Let conversation participants know they are interacting with an AI. Before publi
 
 Every update is tagged as a small version (`v0.x`); the full notes are in [CHANGELOG.md](CHANGELOG.md).
 
+- **v0.6** — Real work mentioned in the owner's chat is handed to an agent (drawings to the draw agent, the rest to Codex) instead of being promised; drawings can look up references online first; a 画图 console tab shows where pictures are, previews, opens and deletes them.
 - **v0.5** — Drawing: the owner or group members ask, Codex's image tool draws, the picture goes back to that chat; members get 3 a day, the owner has no limit.
 - **v0.4** — Opening topics on her own: a bubble in a group that has gone quiet, a message to the designated contact every few hours. The model decides whether to speak; quiet hours and unanswered limits apply, and the pacing survives restarts.
 - **v0.3** — Real @mentions picked from the member list; free-worded send requests read by the local model and checked; blocking and a block list; "总结记忆" on request, and memory updates that no longer fail on long-thinking models; stickers before small emoji, no repeats.

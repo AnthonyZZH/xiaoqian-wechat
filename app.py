@@ -86,6 +86,7 @@ class Bot:
         self.relays = []     # (chat, text) the owner asked her to say
         self.drawings = {}   # job id -> (chat, what): pictures being drawn and where they go
         self.pictures = []   # (chat, image path or None, what): finished, waiting to be sent
+        self.gallery_lock = threading.Lock()  # images/index.json: the worker writes, the console reads
         self.previews = {}   # chat -> last seen session-list preview, to notice news elsewhere
         self.incoming = ChatQueue()
         self.route_retry = {}
@@ -138,6 +139,7 @@ class Bot:
             runner.should_yield = lambda r=runner: self.higher_priority(r)
             runner.agent_command = self.agent_command
             runner.group_command = self.group_command
+            runner.hand_off = self.hand_off
             runner.on_heard = lambda r=runner: self.initiative.heard(r.chat, r.mode)
             runner.on_spoke = lambda opening, r=runner: self.initiative.spoke(r.chat, r.mode, opening)
             runner.on_declined = lambda r=runner: self.initiative.declined(r.chat, r.mode)
@@ -499,6 +501,17 @@ class Bot:
         return {"log": log, "reply": f"好，之后不再接收「{name}」的消息"
                 + ("" if seen else "（还没见过这个名字，按原样拉黑；名字要和群里显示的一致）")}
 
+    def hand_off(self, kind, task):
+        """The chat model heard the owner ask for real work. Drawing goes to the draw agent, anything
+        else to Codex; the local agent only ever runs when the owner names it ("给本机 …")."""
+        if not self.settings["agents_enabled"]:
+            return None
+        if kind == "draw":
+            return self.draw(task)
+        if kind == "codex":
+            return self.dispatch("codex", task)
+        return None
+
     def draw(self, what, here=None):
         """Hand a picture to Codex's image tool; it is sent to `here` (a group) or the owner when done."""
         import agents
@@ -514,6 +527,53 @@ class Bot:
         self.drawings[job_id] = (chat, what)
         self.emit("status", f"开始画：{what[:40]}")
         return "好，画好了发出来，大概要一分钟"
+
+    def draw_folder(self):
+        """Where finished drawings are kept (shown on the console's 画图 page)."""
+        return Path(self.agent_configs()["draw"]["workdir"]) / "images"
+
+    def gallery_notes(self):
+        try:
+            return json.loads((self.draw_folder() / "index.json").read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def save_gallery_notes(self, data):
+        index = self.draw_folder() / "index.json"
+        index.parent.mkdir(parents=True, exist_ok=True)
+        temp = index.with_suffix(".tmp")
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        temp.replace(index)
+
+    def note_drawing(self, path, what, chat):
+        """Remember what a picture was and who it was for, next to the pictures (index.json)."""
+        with self.gallery_lock:
+            data = self.gallery_notes()
+            data[Path(path).name] = {"what": what, "chat": chat, "time": datetime.now().strftime("%m-%d %H:%M")}
+            self.save_gallery_notes(data)
+
+    def drawings_list(self):
+        """Every picture in the folder, newest first: {name, path, what, chat, time}."""
+        folder = self.draw_folder()
+        with self.gallery_lock:
+            notes = self.gallery_notes()
+        files = [f for f in folder.glob("*") if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")] \
+            if folder.is_dir() else []
+        files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        return [{"what": "", "chat": "", "time": datetime.fromtimestamp(f.stat().st_mtime).strftime("%m-%d %H:%M"),
+                 **notes.get(f.name, {}), "name": f.name, "path": f} for f in files]
+
+    def delete_drawing(self, name):
+        """Delete one picture and its note; only a plain file name inside the drawings folder."""
+        folder = self.draw_folder()
+        path = folder / Path(name).name
+        if Path(name).name != name or path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+            raise ValueError("只能删除画图文件夹里的图片")
+        path.unlink(missing_ok=True)
+        with self.gallery_lock:
+            data = self.gallery_notes()
+            if data.pop(name, None) is not None:
+                self.save_gallery_notes(data)
 
     def drawn(self, job):
         """The finished picture's path, or None when nothing usable came out."""
@@ -629,6 +689,8 @@ class Bot:
 
     def agent_configs(self):
         configs = default_configs()
+        for name, config in configs.items():  # work and pictures live with the rest of her data
+            config["workdir"] = str(self.data / "agent_work" / name)
         for name, extra in (self.settings.get("agent_overrides") or {}).items():
             if name in configs and isinstance(extra, dict):
                 configs[name].update(extra)
@@ -702,7 +764,10 @@ class Bot:
                 return
             if job.id in self.drawings:
                 chat, what = self.drawings.pop(job.id)
-                self.pictures.append((chat, self.drawn(job), what))
+                path = self.drawn(job)
+                if path:
+                    self.note_drawing(path, what, chat)
+                self.pictures.append((chat, path, what))
                 continue
             self.reports.append(self.report(job))
             self.emit("status", f"{self.job_label(job)}{JOB_STATES.get(job.status, job.status)}，汇报会发到主人私聊")
@@ -888,6 +953,7 @@ class App:
         self.build_persona(self.tab(notebook, "人设"))
         self.build_model(self.tab(notebook, "模型"))
         self.build_stickers(self.tab(notebook, "表情包"))
+        self.build_gallery(self.tab(notebook, "画图"))
         self.build_memory(self.tab(notebook, "记忆"))
         self.build_rhythm(self.tab(notebook, "节奏"))
         self.refresh_header()
@@ -1397,6 +1463,102 @@ class App:
             self.sticker_list.insert("end", f"{sid}：{desc}")
         if not catalog:
             self.sticker_list.insert("end", "（还没有整理过的表情包）")
+
+    # ---- 画图 ----
+    def build_gallery(self, frame):
+        ttk.Label(frame, wraplength=700, text=(
+            "她画的图（主人或群友让她画、由 Codex 生成）都存在下面这个文件夹。选中一张可以预览、打开、复制路径或删除；"
+            "删除只删电脑上的文件，已经发到微信里的不受影响。")).pack(anchor="w")
+        where = ttk.Frame(frame)
+        where.pack(fill="x", pady=6)
+        ttk.Label(where, text="保存位置：").pack(side="left")
+        self.gallery_dir = tk.StringVar()
+        ttk.Entry(where, textvariable=self.gallery_dir, state="readonly").pack(side="left", fill="x", expand=True)
+        ttk.Button(where, text="打开文件夹", command=self.open_gallery_folder).pack(side="left", padx=6)
+        ttk.Button(where, text="刷新", command=self.show_gallery).pack(side="left")
+        body = ttk.Frame(frame)
+        body.pack(fill="both", expand=True)
+        self.gallery_list = tk.Listbox(body, selectmode="extended", exportselection=False, width=46)
+        self.gallery_list.pack(side="left", fill="both", expand=True)
+        self.gallery_list.bind("<<ListboxSelect>>", lambda e: self.select_drawing())
+        self.gallery_preview = ttk.Label(body, text="选中一张看预览", width=36, anchor="center")
+        self.gallery_preview.pack(side="left", padx=10)
+        self.gallery_path = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.gallery_path, state="readonly").pack(fill="x", pady=(8, 0))
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", pady=6)
+        ttk.Button(bar, text="打开图片", command=self.open_drawing).pack(side="left")
+        ttk.Button(bar, text="复制路径", command=self.copy_drawing_path).pack(side="left", padx=8)
+        ttk.Button(bar, text="删除选中", command=self.delete_drawings).pack(side="right")
+        self.gallery_items = []
+        self.show_gallery()
+
+    def show_gallery(self):
+        self.gallery_dir.set(str(self.bot.draw_folder()))
+        self.gallery_items = self.bot.drawings_list()
+        self.gallery_list.delete(0, "end")
+        for item in self.gallery_items:
+            where = f"发给「{item['chat']}」" if item["chat"] else ""
+            self.gallery_list.insert("end", f"{item['time']}  {item['what'][:24] or item['name']}  {where}")
+        if not self.gallery_items:
+            self.gallery_list.insert("end", "（还没有画过图。私聊里说“画一只橘猫”试试）")
+        self.gallery_path.set("")
+        self.gallery_preview.configure(image="", text="选中一张看预览")
+
+    def picked_drawings(self):
+        return [self.gallery_items[i] for i in self.gallery_list.curselection() if i < len(self.gallery_items)]
+
+    def select_drawing(self):
+        picked = self.picked_drawings()
+        if not picked:
+            return
+        item = picked[-1]
+        self.gallery_path.set(str(item["path"]))
+        try:
+            from PIL import Image, ImageTk
+            with Image.open(item["path"]) as image:
+                thumb = image.convert("RGBA")
+            thumb.thumbnail((280, 280))
+            self.gallery_photo = ImageTk.PhotoImage(thumb)  # keep a reference or Tk drops it
+            self.gallery_preview.configure(image=self.gallery_photo, text="")
+        except (OSError, TypeError):
+            self.gallery_preview.configure(image="", text="（无法预览）")
+
+    def open_gallery_folder(self):
+        folder = self.bot.draw_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        __import__("os").startfile(folder)
+
+    def open_drawing(self):
+        picked = self.picked_drawings()
+        if not picked:
+            self.status.set("先在列表里选中一张图")
+            return
+        __import__("os").startfile(picked[-1]["path"])
+
+    def copy_drawing_path(self):
+        picked = self.picked_drawings()
+        if not picked:
+            self.status.set("先在列表里选中一张图")
+            return
+        self.window.clipboard_clear()
+        self.window.clipboard_append(str(picked[-1]["path"]))
+        self.status.set("图片路径已复制")
+
+    def delete_drawings(self):
+        picked = self.picked_drawings()
+        if not picked:
+            self.status.set("先在列表里选中要删除的图（按住 Ctrl 可多选）")
+            return
+        if not messagebox.askyesno("删除图片", f"删除选中的 {len(picked)} 张图？电脑上的文件会删掉，微信里已发出的不受影响。"):
+            return
+        for item in picked:
+            try:
+                self.bot.delete_drawing(item["name"])
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("删除图片", f"{item['name']} 没删掉：{exc}")
+        self.status.set(f"已删除 {len(picked)} 张图")
+        self.show_gallery()
 
     # ---- 记忆 ----
     def build_memory(self, frame):

@@ -356,7 +356,8 @@ def default_configs() -> dict:
             "reasoning": "high",
         },
         "draw": {
-            "cmd": list(codex_cmd),
+            # --search 是 codex 顶层参数，必须放在 exec 前；exec 子命令本身不接受它。
+            "cmd": ["{codex}", "--search", *codex_cmd[1:]],
             "workdir": _default_workdir("draw"),
             "timeout": 300,
             "model": "gpt-6.1-sol",
@@ -391,6 +392,10 @@ DEFAULT_CONFIGS = default_configs()
 
 _DRAW_DESCRIPTION_CHARS = 800
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+_REFERENCE_HINT = re.compile(
+    r"网上|网络|联网|搜索|搜图|找图|参考图|参考图片|参考.{0,4}(?:形象|照片|图片|造型)|"
+    r"二创|同人|角色|官方形象|原作|原型|立绘|剧照|写真|照片|相片|截图"
+)
 
 
 def draw_task(description: str) -> str:
@@ -399,12 +404,21 @@ def draw_task(description: str) -> str:
     clean = clean[:_DRAW_DESCRIPTION_CHARS].rstrip()
     if not clean:
         clean = "一张简洁自然的图片"
-    return (
+    task = (
         f"用图片生成工具画：{clean}\n"
         "只生成一张图片，并保存为当前目录下的 out.png。\n"
         "不许用代码、Pillow、SVG、Canvas、截图、下载现成图片或其他方式凑一张。\n"
-        "如果没有图片生成工具，只输出一行：NO_IMAGE_TOOL"
     )
+    if _REFERENCE_HINT.search(clean):
+        task += (
+            "先用实时联网搜索查找描述中的人物、角色或形象，选择 1～3 张合适的参考图保存到当前目录的 refs/，"
+            "再把这些本地参考图作为输入交给图片生成工具。\n"
+            "refs/ 里的下载图片只能用作参考，绝不允许直接复制、改名或当成 out.png 交差；"
+            "out.png 必须是图片生成工具新生成的图片。\n"
+            "如果找不到可用参考图，就直接照文字描述生成，并在最终输出中另加一行：NO_REFERENCE\n"
+        )
+    task += "如果没有图片生成工具，只输出一行：NO_IMAGE_TOOL"
+    return task
 
 
 def _recent_image(path: Path, earliest: float) -> tuple[float, Path] | None:
@@ -422,13 +436,31 @@ def find_image(job, workdir, generated_root=Path.home() / ".codex" / "generated_
     """找到本次画图结果，复制进任务工作目录的 images 文件夹。"""
     folder = Path(workdir)
     out = folder / "out.png"
+    try:
+        refs = (folder / "refs").resolve()
+    except OSError:
+        refs = folder / "refs"
     earliest = float(job.started) - 2
     found = _recent_image(out, earliest)
+    if found is not None and refs.is_dir():
+        # A downloaded reference handed in as the result is not a drawing: look for the real one.
+        try:
+            data = out.read_bytes()
+            if any(ref.is_file() and ref.stat().st_size == len(data) and ref.read_bytes() == data
+                   for ref in refs.rglob("*")):
+                found = None
+        except OSError:
+            found = None
 
     if found is None:
         candidates = []
         try:
             for path in Path(generated_root).rglob("*"):
+                try:
+                    if path.resolve().is_relative_to(refs):
+                        continue
+                except OSError:
+                    continue
                 candidate = _recent_image(path, earliest)
                 if candidate is not None:
                     candidates.append(candidate)

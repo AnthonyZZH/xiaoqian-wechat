@@ -921,3 +921,66 @@ class AgentBridgeTests(Temp):
         self.tick(bot, 3)
         self.assertEqual(bot.settings['blocked'], [])
         self.assertNotIn('记住了', ' '.join(s for _, s in wx.sent))
+
+    # ---- free wording for real work: the chat model hands it to an agent ----
+    def test_a_free_worded_drawing_request_is_handed_to_the_draw_agent(self):
+        bot, wx = self.make([{'speak': True, 'to_me': True, 'text': '我这就去网上翻翻',
+                              'handoff': {'kind': 'draw', 'task': '给小千画一个高清头像，参考网上的二创形象'}}])
+        self.tick(bot)
+        self.owner_says(bot, wx, '给你自己的画一个高清头像吧，用网上二创的形象', ticks=2)
+        self.assertTrue(self.prompts[0]['handoff'])
+        job, = bot.agents.jobs()
+        self.assertEqual(job.agent, 'draw')
+        self.assertIn('参考网上的二创形象', job.task)
+        self.assertEqual(wx.sent, [('示例好友', '好，画好了发出来，大概要一分钟')])  # never "我这就去翻"
+        self.wait_jobs(bot)
+        self.tick(bot, 3)
+        self.assertEqual(wx.sent[-1], ('示例好友', f'IMG:{job.id}.png'))
+
+    def test_other_real_work_goes_to_codex_not_the_local_agent(self):
+        bot, wx = self.make([{'speak': True, 'to_me': True, 'text': '行',
+                              'handoff': {'kind': 'codex', 'task': '查一下明天北京的天气，整理成一句话'}}])
+        self.tick(bot)
+        self.owner_says(bot, wx, '帮我看看明天天气咋样', ticks=2)
+        job, = bot.agents.jobs()
+        self.assertEqual((job.agent, job.task), ('codex', '查一下明天北京的天气，整理成一句话'))
+        self.assertEqual(wx.sent, [('示例好友', '收到，交给 Codex 了，做完告诉你')])
+
+    def test_plain_chat_is_not_handed_off_and_groups_never_are(self):
+        bot, wx = self.make([{'speak': True, 'to_me': True, 'text': '哈哈好呀', 'handoff': {'kind': 'none', 'task': ''}},
+                             {'speak': True, 'to_me': True, 'text': '来了',
+                              'handoff': {'kind': 'draw', 'task': '画只猫'}}])
+        bot.settings.update(aliases=['机器人昵称'])
+        self.tick(bot)
+        self.owner_says(bot, wx, '今天好开心', ticks=2)
+        self.assertEqual(wx.sent, [('示例好友', '哈哈好呀')])
+        wx.post('示例群甲', '@机器人昵称 来画只猫呗', sender='阿杰')
+        self.tick(bot, 3)
+        self.assertNotIn('handoff', self.prompts[1])
+        self.assertEqual(bot.agents.jobs(), [])
+
+    def test_with_agents_off_a_handoff_is_just_chat(self):
+        bot, wx = self.make([{'speak': True, 'to_me': True, 'text': '好的呀',
+                              'handoff': {'kind': 'draw', 'task': '画只猫'}}])
+        bot.settings.update(agents_enabled=False)
+        self.tick(bot)
+        self.owner_says(bot, wx, '画个东西给我看看呗', ticks=2)
+        self.assertEqual(bot.agents.jobs(), [])
+        self.assertEqual(wx.sent, [('示例好友', '好的呀')])
+
+    def test_finished_drawings_are_listed_and_can_be_deleted(self):
+        bot, wx = self.make()
+        self.tick(bot)
+        self.owner_says(bot, wx, '画一只橘猫')
+        self.wait_jobs(bot)
+        self.tick(bot, 3)
+        item, = bot.drawings_list()
+        self.assertEqual((item['what'], item['chat']), ('一只橘猫', '示例好友'))
+        self.assertTrue(item['path'].is_file())
+        self.assertEqual(item['path'].parent, bot.draw_folder())
+        with self.assertRaises(ValueError):
+            bot.delete_drawing('../index.json')
+        bot.delete_drawing(item['name'])
+        self.assertFalse(item['path'].exists())
+        self.assertEqual(bot.drawings_list(), [])
+        self.assertEqual(bot.gallery_notes(), {})

@@ -162,15 +162,15 @@ class BrainExtrasTests(Temp):
         self.assertNotIn('sticker', props)
 
     def test_search_round_trip(self):
-        brain = self.make({'speak': False, 'text': '', 'search': '悉尼 天气'},
-                          {'speak': True, 'text': '今天悉尼22度[太阳]'})
-        brain.search = mock.Mock(return_value='1. 悉尼天气（bom.gov.au）：晴 22°C')
-        result = brain.decide([{'role': 'user', 'text': '悉尼今天热吗'}], chat='A')
-        brain.search.assert_called_once_with('悉尼 天气')
+        brain = self.make({'speak': False, 'text': '', 'search': '北京 天气'},
+                          {'speak': True, 'text': '今天北京22度[太阳]'})
+        brain.search = mock.Mock(return_value='1. 北京天气（bom.gov.au）：晴 22°C')
+        result = brain.decide([{'role': 'user', 'text': '北京今天热吗'}], chat='A')
+        brain.search.assert_called_once_with('北京 天气')
         second = brain.post.call_args_list[1][0][0]
         self.assertIn('晴 22°C', second['messages'][-1]['content'])
         self.assertNotIn('search', second['response_format']['json_schema']['schema']['properties'])
-        self.assertEqual((result['text'], result['search']), ('今天悉尼22度[太阳]', '悉尼 天气'))
+        self.assertEqual((result['text'], result['search']), ('今天北京22度[太阳]', '北京 天气'))
 
     def test_no_search_offered_when_off_or_proactive(self):
         brain = self.make({'speak': False, 'text': ''}, {'speak': False, 'text': ''}, web_search=False)
@@ -551,6 +551,33 @@ class RhythmSettingsTests(Temp):
             self.assertTrue(bot.settings['initiative_group'])
             self.assertEqual(bot.settings['initiative_quiet_hours'],
                              {'private': '23-7', 'group': '0-6'})
+        finally:
+            app.window.destroy()
+
+
+class GalleryTests(Temp):
+    def test_console_lists_previews_and_deletes_drawings(self):
+        from app import App, Bot
+        bot = Bot(Settings(self.dir / 's.json'), PersonaStore(self.dir / 'p'), False,
+                  log_dir=self.dir / 'logs', data_dir=self.dir / 'data')
+        folder = bot.draw_folder()
+        self.assertEqual(folder, self.dir / 'data' / 'agent_work' / 'draw' / 'images')
+        folder.mkdir(parents=True)
+        Image.new('RGB', (40, 40), (240, 160, 60)).save(folder / 'draw-1.png')
+        bot.note_drawing(folder / 'draw-1.png', '一只橘猫', '示例好友')
+        app = App(bot)
+        app.window.withdraw()
+        try:
+            self.assertIn('一只橘猫', app.gallery_list.get(0))
+            self.assertIn('示例好友', app.gallery_list.get(0))
+            self.assertEqual(app.gallery_dir.get(), str(folder))
+            app.gallery_list.selection_set(0)
+            app.select_drawing()
+            self.assertEqual(app.gallery_path.get(), str(folder / 'draw-1.png'))
+            with mock.patch('app.messagebox.askyesno', return_value=True):
+                app.delete_drawings()
+            self.assertFalse((folder / 'draw-1.png').exists())
+            self.assertIn('还没有画过图', app.gallery_list.get(0))
         finally:
             app.window.destroy()
 

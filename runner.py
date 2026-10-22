@@ -106,6 +106,8 @@ class Runner:
         self.on_heard = lambda: None
         self.on_spoke = lambda opening: None
         self.on_declined = lambda: None
+        # The owner asked for real work (a drawing, a Codex task): (kind, task) -> receipt or None.
+        self.hand_off = lambda kind, task: None
         self.replaying = False  # set by ingest(replay=True): pause-time messages are never acted on
         self.mode = settings.chat_mode(chat) or outbound_mode
         if self.mode not in ("private", "group"):
@@ -645,7 +647,8 @@ class Runner:
                 **({"batch": [{"text": m.text, "sender": getattr(m, "sender", "")} for m in self.pending]}
                    if len(self.pending) > 1 else {}),
                 **({"relay_targets": self.relay_targets(), "context": self.context(),
-                    "relay_messages": [m.text for m in self.pending]} if self.is_owner() and not opening else {}),
+                    "relay_messages": [m.text for m in self.pending], "handoff": True}
+                   if self.is_owner() and not opening else {}),
                 **({"opening": opening} if opening else {}))
             speak, text, sticker = self.parse(result)
             if speak and not proactive and not mentioned and isinstance(result, dict) \
@@ -681,6 +684,13 @@ class Runner:
                     self.relay_queue.append((target, body))
                 else:
                     self.emit("error", "转告目标与主人指定的不一致，已拒绝；不会改发到其他聊天")
+        handoff = result.get("handoff") if self.is_owner() and not opening and isinstance(result, dict) else None
+        if isinstance(handoff, dict) and handoff.get("kind") in ("draw", "codex") \
+                and str(handoff.get("task") or "").strip():
+            # Real work goes to an agent now, and she only says what really happened.
+            receipt = self.hand_off(handoff["kind"], " ".join(str(handoff["task"]).split()))
+            if receipt:
+                speak, text, sticker = True, receipt, None
         if proactive:
             self.proactive_used = True  # Also stop repeated polling if the LLM chose silence.
         if not speak:

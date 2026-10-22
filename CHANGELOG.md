@@ -2,6 +2,13 @@
 
 Each update to this repository is tagged as a small version (`v0.1`, `v0.2`, …).
 
+## v0.6
+
+- Hand-off: in the owner's chat the reply schema has `handoff {kind: none|draw|codex, task}`. Real work mentioned in passing goes to the draw agent or Codex and she replies with the receipt; the local agent still runs only when named. Group chats never hand off.
+- Drawing with references: the draw agent runs `codex --search exec`; descriptions that ask for an online look, fan art, a character or a photo make it save 1-3 references to `refs/` and generate a new picture from them. References are never taken as the result, not even when copied to `out.png`.
+- Console 画图 tab: the drawings folder, each picture's subject, chat and time (`images/index.json`), preview, open, copy path, delete.
+- Agent work folders follow the bot's data directory.
+
 ## v0.5
 
 - Drawing: "画一只…" / "帮我画：…" from the owner (no limit) or from group members who @ her (`draw_daily_limit`, default 3 a day each). A dedicated `draw` agent runs Codex's image tool; the picture is found (`out.png`, else Codex's generated images), archived, and sent back to the chat that asked with the paste-image path. Failures are reported in that chat.

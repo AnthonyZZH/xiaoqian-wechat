@@ -34,7 +34,9 @@ class DefaultConfigTests(unittest.TestCase):
     def test_draw_is_an_independent_low_reasoning_codex_agent(self):
         configs = default_configs()
         draw, codex = configs["draw"], configs["codex"]
-        self.assertEqual(draw["cmd"], codex["cmd"])
+        self.assertEqual(draw["cmd"][:3], ["{codex}", "--search", "exec"])
+        self.assertNotIn("--search", codex["cmd"])
+        self.assertEqual([arg for arg in draw["cmd"] if arg != "--search"], codex["cmd"])
         self.assertEqual(draw["model"], "gpt-6.1-sol")
         self.assertEqual(draw["reasoning"], "low")
         self.assertEqual(draw["timeout"], 300)
@@ -50,6 +52,21 @@ class DrawTaskTests(unittest.TestCase):
         self.assertIn("out.png", task)
         self.assertIn("不许用代码", task)
         self.assertEqual(task.splitlines()[-1], "如果没有图片生成工具，只输出一行：NO_IMAGE_TOOL")
+        self.assertNotIn("实时联网搜索", task)
+        self.assertNotIn("NO_REFERENCE", task)
+
+    def test_reference_request_searches_and_uses_downloads_only_as_inputs(self):
+        task = draw_task("给自己画高清头像，用网上二创的形象")
+        self.assertIn("实时联网搜索", task)
+        self.assertIn("1～3 张", task)
+        self.assertIn("refs/", task)
+        self.assertIn("本地参考图作为输入", task)
+        self.assertIn("out.png 必须是图片生成工具新生成", task)
+        self.assertIn("NO_REFERENCE", task)
+
+    def test_a_plain_avatar_does_not_go_online(self):
+        task = draw_task("给我画个可爱的头像")
+        self.assertNotIn("实时联网搜索", task)
 
     def test_description_is_single_line_and_bounded(self):
         task = draw_task("  猫\n穿毛衣\t" + "很" * 2000)
@@ -577,6 +594,32 @@ class AgentJobsTests(unittest.TestCase):
 
         self.assertEqual(result, self.root / "work" / "images" / f"{job.id}.webp")
         self.assertEqual(result.read_bytes(), b"latest")
+
+    def test_reference_images_are_never_selected_as_output(self):
+        workdir = self.root / "work"
+        refs = workdir / "refs"
+        refs.mkdir(parents=True)
+        (refs / "reference.png").write_bytes(b"reference-only")
+        manager, _, _ = self.make_jobs(self.make_config("print('done')"))
+        job_id = manager.start("fake", "画角色")
+        job = self.wait(manager, job_id)
+
+        self.assertIsNone(find_image(job, workdir, workdir))
+        self.assertFalse((workdir / "images").exists())
+
+    def test_a_reference_handed_in_as_out_png_is_not_the_result(self):
+        workdir = self.root / "work"
+        refs = workdir / "refs"
+        refs.mkdir(parents=True)
+        (refs / "fanart.png").write_bytes(b"downloaded")
+        generated = self.root / "generated"
+        generated.mkdir()
+        manager, _, _ = self.make_jobs(self.make_config("print('done')"))
+        job = self.wait(manager, manager.start("fake", "画角色"))
+        (workdir / "out.png").write_bytes(b"downloaded")  # copied, not drawn
+        (generated / "drawn.png").write_bytes(b"really drawn")
+        result = find_image(job, workdir, generated)
+        self.assertEqual(result.read_bytes(), b"really drawn")
 
     def test_old_images_are_ignored_and_old_out_is_cleaned(self):
         generated = self.root / "generated"

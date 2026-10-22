@@ -170,7 +170,14 @@ def opening_situation(mode: str, idle_minutes: float, unanswered: int = 0) -> st
     return text + "如果实在没有自然的话可说，就保持沉默（speak=false）。"
 
 
-def schema(sticker_ids=(), search=False, relay_targets=()) -> dict:
+HANDOFF_HINT = ("如果主人明确要你去做一件聊天以外的实事——画图、做头像、做表情图（kind=draw），"
+                "或者上网查资料并整理、写文件、做表格、改代码之类（kind=codex）——就在 handoff 里填 kind 和 task，"
+                "task 要把主人的要求、参考、想要的格式都写清楚。系统会交给对应的 agent 去做，并替你回复主人，"
+                "所以这时 text 留空。你自己不会画图，也不能上网或操作电脑，绝不要说你正在做或已经做了。"
+                "只是聊天、开玩笑、问你意见、让你回忆时 kind=none。")
+
+
+def schema(sticker_ids=(), search=False, relay_targets=(), handoff=False) -> dict:
     # to_me comes first so the model reads the room before it decides to speak.
     props = {"to_me": {"type": "boolean"}, "speak": {"type": "boolean"}, "text": {"type": "string"}}
     if sticker_ids:
@@ -183,6 +190,10 @@ def schema(sticker_ids=(), search=False, relay_targets=()) -> dict:
         props["relays"] = {"type": "array", "items": {"type": "object", "properties": {
             "chat": {"type": "string", "enum": list(relay_targets)}, "text": {"type": "string"}},
             "required": ["chat", "text"], "additionalProperties": False}}
+    if handoff:
+        props["handoff"] = {"type": "object", "properties": {
+            "kind": {"type": "string", "enum": ["none", "draw", "codex"]}, "task": {"type": "string"}},
+            "required": ["kind", "task"], "additionalProperties": False}
     return {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
 
 
@@ -372,7 +383,7 @@ class Brain:
             return f"（搜索失败：{str(exc)[:100]}）"
 
     def decide(self, history, proactive=False, *, chat="", mode="private", mentioned=False, continuing=False, memory="",
-               relay_targets=(), context="", relay_messages=None, batch=(), opening=None) -> dict:
+               relay_targets=(), context="", relay_messages=None, batch=(), opening=None, handoff=False) -> dict:
         persona = self.persona()
         last_user = next((r["text"] for r in reversed(history) if r["role"] == "user"), "")
         if not proactive and wants_silence(last_user, persona.name):
@@ -395,6 +406,7 @@ class Brain:
         due = bool(catalog) and since >= int(self.settings.get("sticker_every", 2))
         used_emojis = recent_wechat_emojis(history)
         extra = "\n".join(x for x in (context, memory, extras(catalog, searching, due, used_emojis),
+                                       HANDOFF_HINT if handoff else "",
                                        relay_hint(relay_targets) if relay_targets else "") if x)
         if batch:
             lines = [f"{row.get('sender') or chat}：{row['text']}" for row in batch]
@@ -405,7 +417,7 @@ class Brain:
         record = {"persona": persona.name, "chat": chat, "proactive": proactive}
         started = time.monotonic()
         # An open-ended opening makes some models think much longer than a reply does.
-        parsed = self.call(messages, persona.temperature, schema(sticker_ids, searching, relay_targets), record,
+        parsed = self.call(messages, persona.temperature, schema(sticker_ids, searching, relay_targets, handoff), record,
                            max_tokens=4000 if opening else None)
         query = " ".join(str(parsed.get("search") or "").split())[:60]
         if query:
@@ -413,7 +425,7 @@ class Brain:
             messages = messages[:-1] + [{"role": "system", "content":
                 f"你刚搜索了「{query}」，结果如下：\n{found}\n根据结果自然地回复；结果不相关或失败就照常聊，"
                 "不要编造来源和数字。" + situation(mode, proactive, mentioned, continuing) + " /no_think"}]
-            parsed = self.call(messages, persona.temperature, schema(sticker_ids, False, relay_targets),
+            parsed = self.call(messages, persona.temperature, schema(sticker_ids, False, relay_targets, handoff),
                                dict(record, search=query))
         text = clean_reply(strip_unknown_emoji(parsed["text"]), self.settings["max_reply_chars"], persona.name)
         sticker = parsed.get("sticker") or ""
@@ -435,4 +447,5 @@ class Brain:
         return {"speak": parsed["speak"] and bool(text or sticker), "to_me": parsed.get("to_me", True),
                 "relay": relay, "relays": relays,
                 "text": text, "sticker": sticker, "search": query,
+                **({"handoff": parsed.get("handoff")} if handoff else {}),
                 "seconds": round(time.monotonic() - started, 2)}
