@@ -440,6 +440,57 @@ class MediaTests(Base):
         self.assertEqual(self.adapter.sent, ['行吧', 'IMG:eyeroll.png'])
         self.assertEqual([r['text'] for r in self.runner.history][-2:], ['行吧', '[表情包：翻白眼的猫]'])
 
+    def test_sticker_number_echoed_into_text_is_removed(self):
+        self.reply(text='变脸比翻书快啊[奸笑] eyeroll', sticker='eyeroll')
+        self.add(); self.runner.step()
+        self.assertEqual(self.adapter.sent, ['变脸比翻书快啊[奸笑]', 'IMG:eyeroll.png'])
+
+    def test_prompt_prefers_stickers_after_two_plain_replies_and_blocks_recent_emoji(self):
+        from brain import Brain
+        brain = Brain(self.settings, None, self.library, log_path=Path(self.temp.name) / 'calls.jsonl')
+        seen = []
+        brain.persona = lambda: type('P', (), {'name': '小千', 'temperature': 0.8})()
+        brain.messages = lambda persona, history, chat, mode, proactive, mentioned, extra, continuing=False: \
+            seen.append(extra) or []
+        brain.call = lambda *a, **k: {'speak': False, 'text': ''}
+        due = [{'role': 'assistant', 'text': '第一句[白眼]'},
+               {'role': 'user', 'text': '再说说'},
+               {'role': 'assistant', 'text': '第二句[捂脸]'}]
+        brain.decide(due, chat='示例', mode='private')
+        brain.decide([{'role': 'assistant', 'text': '只有一句'}], chat='示例', mode='private')
+        brain.decide(due + [{'role': 'assistant', 'text': '[表情包：翻白眼的猫]'}], chat='示例', mode='private')
+        self.assertIn('表情包图片优先', seen[0])
+        self.assertIn('好几轮没发表情包', seen[0])
+        self.assertIn('[捂脸]、[白眼]', seen[0])
+        self.assertIn('一条 text 最多一个', seen[0])
+        self.assertNotIn('好几轮没发表情包', seen[1])
+        self.assertNotIn('好几轮没发表情包', seen[2])
+
+    def test_text_keeps_one_fresh_small_emoji_and_removes_recent_or_extra_ones(self):
+        self.runner.history = [{'role': 'assistant', 'text': '刚才用过[白眼]'}]
+        self.reply(text='行吧[白眼][旺柴][奸笑]')
+        self.add(); self.runner.step()
+        self.assertEqual(self.adapter.sent, ['行吧[旺柴]'])
+
+    def test_recent_small_emoji_only_reply_becomes_silence(self):
+        self.runner.history = [{'role': 'assistant', 'text': '刚才用过[白眼]'}]
+        self.reply(text=' [白眼] ')
+        self.add(); self.runner.step()
+        self.assertEqual(self.adapter.sent, [])
+
+    def test_removed_emoji_only_text_still_allows_a_sticker(self):
+        self.runner.history = [{'role': 'assistant', 'text': '刚才用过[白眼]'}]
+        self.reply(text='[白眼]', sticker='eyeroll')
+        self.add(); self.runner.step()
+        self.assertEqual(self.adapter.sent, ['IMG:eyeroll.png'])
+
+    def test_small_emoji_can_return_after_four_assistant_messages(self):
+        self.runner.history = ([{'role': 'assistant', 'text': '很早用过[白眼]'}]
+                               + [{'role': 'assistant', 'text': f'后来第{i}句'} for i in range(4)])
+        self.reply(text='现在可以了[白眼]')
+        self.add(); self.runner.step()
+        self.assertEqual(self.adapter.sent, ['现在可以了[白眼]'])
+
     def test_sticker_only_reply(self):
         self.reply(sticker='eyeroll')
         self.add(); self.runner.step()

@@ -32,9 +32,16 @@ SUMMARY = "Claude 把报告整理好了，放在 C:\\work\\报告.md，" + "表�
 class WeChat(FakeWeChat):
     """Enforces the real adapter's rules: one line, 100 chars unless raised for this send."""
 
-    def send(self, text, cancel, max_chars=None):
+    members = {}  # chat -> names the @ popover offers; a chat not listed offers everyone
+
+    def send(self, text, cancel, max_chars=None, at=()):
         assert "\n" not in text and len(text) <= (max_chars or 100), text
-        super().send(text, cancel)
+        assert not at or self.modes[self.open] == 'group', 'only groups have an @ popover'
+        offered = self.members.get(self.open)
+        missing = [m for m in at if offered is not None and m not in offered]
+        self.mentions = getattr(self, 'mentions', []) + [(self.open, tuple(m for m in at if m not in missing))]
+        super().send("".join(f"@{m} " for m in at) + text, cancel)
+        return missing
 
     def validate(self):
         pass
@@ -70,8 +77,15 @@ class AgentBridgeTests(Temp):
                 raise RuntimeError("连不上 LM Studio")
             return summary
 
+        self.wishes, self.parsed = [], []
+
+        def parse_send(text, **kw):
+            self.parsed.append(dict(kw, text=text))
+            return self.wishes.pop(0) if self.wishes else {'send': False, 'chat': '', 'at': [], 'text': ''}
+
         bot.brain = type('B', (), {'decide': staticmethod(decide), 'learn': staticmethod(lambda *a, **k: {}),
-                                   'summarize_job': staticmethod(summarize_job)})()
+                                   'summarize_job': staticmethod(summarize_job),
+                                   'parse_send': staticmethod(parse_send)})()
         bot.enabled.set()
         bot.make_runner()
         return bot, wx
@@ -535,7 +549,7 @@ class AgentBridgeTests(Temp):
                                  ('帮我给 文件传输助手 发消息：测试', '文件传输助手', '测试')]:
             bot.relays.clear()
             self.assertEqual(bot.agent_command(text), {'log': text, 'reply': None}, text)
-            self.assertEqual(bot.relays, [(chat, body, True)], text)
+            self.assertEqual(bot.relays, [(chat, body, ())], text)
         for text in ('给我发：好的', '你没发啊', '去群里说句话', '给claude发：写周报', '给示例联系人发'):
             bot.relays.clear()
             bot.agent_command(text)
@@ -545,19 +559,84 @@ class AgentBridgeTests(Temp):
         bot, wx = self.make()
         bot.settings.update(chats={'示例好友': {'mode': 'private'}, '示例测试群': {'mode': 'group'}})
         wx.chats['示例测试群'], wx.modes['示例测试群'] = [], 'group'
-        for text, chat, body in [('在测试群里艾特小王说：周末一起吃饭吗？', '示例测试群', '@小王 周末一起吃饭吗？'),
-                                 ('去测试群说：今晚八点', '示例测试群', '今晚八点'),
-                                 ('在示例测试群里@小李 说：早', '示例测试群', '@小李 早'),
-                                 ('到 文件传输助手 发：测试', '文件传输助手', '测试')]:
+        for text, chat, body, at in [('在测试群里艾特小王说：周末一起吃饭吗？', '示例测试群', '周末一起吃饭吗？', ('小王',)),
+                                     ('去测试群说：今晚八点', '示例测试群', '今晚八点', ()),
+                                     ('在示例测试群里@小李 说：早', '示例测试群', '早', ('小李',)),
+                                     ('在测试群里艾特我，说：测试一下', '示例测试群', '测试一下', ('示例好友',)),
+                                     ('到 文件传输助手 发：测试', '文件传输助手', '测试', ())]:
             bot.relays.clear()
             self.assertEqual(bot.agent_command(text), {'log': text, 'reply': None}, text)
-            self.assertEqual(bot.relays, [(chat, body, True)], text)
+            self.assertEqual(bot.relays, [(chat, body, at)], text)
         bot.relays.clear()
         self.tick(bot)
         self.owner_says(bot, wx, '在测试群里艾特小王说：周末一起吃饭吗？', ticks=3)
-        self.assertIn(('示例测试群', '@小王 周末一起吃饭吗？'), wx.sent)
+        self.assertIn(('示例测试群', ('小王',)), wx.mentions)  # a real @, picked in the popover
         self.assertEqual(wx.sent[-1], ('示例好友', '已发给「示例测试群」：@小王 周末一起吃饭吗？'))
         self.assertEqual(self.prompts, [])
+        self.assertEqual(self.parsed, [])  # the fixed wording never needs the model
+
+    def test_free_wording_is_read_by_the_model_then_checked(self):
+        bot, wx = self.make()
+        wx.members = {'示例群甲': ['示例好友', '小李', '阿杰']}
+        self.tick(bot)
+        self.wishes.append({'send': True, 'chat': '', 'at': ['示例好友'], 'text': '测试一下'})
+        self.owner_says(bot, wx, '在群里艾特我，说：测试一下', ticks=3)
+        self.assertIn(('示例群甲', ('示例好友',)), wx.mentions)
+        self.assertEqual(wx.sent[-1], ('示例好友', '已发给「示例群甲」：@示例好友 测试一下'))
+        self.assertEqual(self.prompts, [])  # never a chat reply that claims it was sent
+
+    def test_free_wording_maps_a_nickname_to_a_seen_member(self):
+        bot, wx = self.make()
+        (self.dir / 'data' / 'senders').mkdir(parents=True, exist_ok=True)
+        (self.dir / 'data' / 'senders' / '示例群甲.json').write_text(
+            json.dumps([{'hash': '1', 'names': {'小李': 3}, 'label': None}]), encoding='utf-8')
+        self.tick(bot)
+        self.wishes.append({'send': True, 'chat': '示例群甲', 'at': ['小李'], 'text': '你好'})
+        self.owner_says(bot, wx, '去示例群甲跟小王打个招呼', ticks=3)
+        self.assertIn('小李', self.parsed[0]['members']('示例群甲'))
+        self.assertEqual(wx.sent[-1], ('示例好友', '已发给「示例群甲」：@小李 你好'))
+
+    def test_free_wording_never_sends_to_a_guess(self):
+        for wish, question in [
+                ({'send': True, 'chat': '别的群', 'at': [], 'text': '你好'}, '要发到哪个聊天'),
+                ({'send': True, 'chat': '示例群甲', 'at': ['张三'], 'text': '你好'}, '没认出要艾特的「张三」'),
+                ({'send': True, 'chat': '示例群甲', 'at': [], 'text': ''}, '要在「示例群甲」说什么')]:
+            with self.subTest(wish=wish):
+                bot, wx = self.make()
+                self.tick(bot)
+                self.wishes.append(wish)
+                self.owner_says(bot, wx, '帮我去群里说一声', ticks=3)
+                self.assertNotIn('示例群甲', [chat for chat, _ in wx.sent])
+                self.assertIn(question, wx.sent[-1][1])
+
+    def test_free_wording_with_several_groups_needs_the_group_named(self):
+        bot, wx = self.make()
+        bot.settings.update(chats={'示例好友': {'mode': 'private'}, '示例群甲': {'mode': 'group'},
+                                   '饭友群': {'mode': 'group'}})
+        self.tick(bot)
+        self.wishes += [{'send': True, 'chat': '饭友群', 'at': ['示例好友'], 'text': '测试一下'},
+                        {'send': True, 'chat': '饭友群', 'at': [], 'text': '开饭了'}]
+        self.owner_says(bot, wx, '艾特我说：测试一下', ticks=3)  # the model guessed a group
+        self.assertEqual(wx.sent[-1], ('示例好友', '要发到哪个聊天？请写完整的聊天名，例如“在示例测试群里说：…”'))
+        bot.agent_command('跟饭友说一声开饭了')  # named in short: fine
+        self.assertEqual(bot.relays, [('饭友群', '开饭了', ())])
+
+    def test_free_wording_the_model_calls_chat_is_ordinary_chat(self):
+        bot, wx = self.make([{'speak': True, 'to_me': True, 'text': '在聊晚饭'}])
+        self.tick(bot)
+        self.owner_says(bot, wx, '群里刚才在说什么', ticks=2)
+        self.assertEqual(len(self.parsed), 1)
+        self.assertEqual(wx.sent, [('示例好友', '在聊晚饭')])
+        self.owner_says(bot, wx, '晚饭吃什么', ticks=2)
+        self.assertEqual(len(self.parsed), 1)  # no send wording, no extra model call
+
+    def test_a_member_the_popover_lacks_goes_out_as_plain_text(self):
+        bot, wx = self.make()
+        wx.members = {'示例群甲': ['阿杰']}
+        self.tick(bot)
+        self.owner_says(bot, wx, '在示例群甲里艾特小王说：吃饭了', ticks=3)
+        self.assertIn(('示例群甲', ()), wx.mentions)
+        self.assertEqual(wx.sent[-1], ('示例好友', '已发给「示例群甲」：@小王 吃饭了（群成员里没找到 小王，按文字写的 @）'))
 
     def test_short_chat_names_never_guess(self):
         bot, _ = self.make()
@@ -615,3 +694,79 @@ class AgentBridgeTests(Temp):
         wx.post('示例群甲', '给示例联系人发：晚安', sender='示例群友')
         self.tick(bot, 3)
         self.assertNotIn('示例联系人', [chat for chat, _ in wx.sent])
+
+    # ---- blocking and memory, also from the owner inside a group ----
+    def test_owner_blocks_someone_from_the_group(self):
+        bot, wx = self.make([{'speak': True, 'to_me': True, 'text': '在呢'}])
+        bot.settings.update(aliases=['机器人昵称'])
+        self.tick(bot)
+        wx.post('示例群甲', '@机器人昵称 不允许再接收@小李 的消息', sender='示例好友')
+        self.tick(bot, 3)
+        self.assertEqual(bot.settings['blocked'], ['小李'])
+        self.assertIn(('示例群甲', '好，之后不再接收「小李」的消息（还没见过这个名字，按原样拉黑；名字要和群里显示的一致）'),
+                      wx.sent)
+        self.assertEqual(self.prompts, [])
+        wx.post('示例群甲', '@机器人昵称 你是人吗', sender='小李')
+        self.tick(bot, 3)
+        self.assertEqual(self.prompts, [])  # never even read
+        self.assertNotIn('你是人吗', [r['text'] for r in bot.runners['示例群甲'].history])
+        wx.post('示例群甲', '@机器人昵称 你在吗', sender='阿杰')
+        self.tick(bot, 3)
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_only_the_owner_addressing_her_can_block_in_a_group(self):
+        bot, wx = self.make()
+        bot.settings.update(aliases=['机器人昵称'])
+        self.tick(bot)
+        wx.post('示例群甲', '@机器人昵称 拉黑示例好友', sender='小李')
+        wx.post('示例群甲', '拉黑阿杰', sender='示例好友')  # not addressed to her: just chat
+        self.tick(bot, 3)
+        self.assertEqual(bot.settings['blocked'], [])
+
+    def test_block_list_and_unblock_in_the_owner_chat(self):
+        bot, wx = self.make()
+        self.tick(bot)
+        self.owner_says(bot, wx, '拉黑 阿杰')
+        self.owner_says(bot, wx, '黑名单')
+        self.owner_says(bot, wx, '解除拉黑阿杰')
+        self.owner_says(bot, wx, '拉黑示例好友')
+        self.assertEqual([t for c, t in wx.sent if c == '示例好友'],
+                         ['好，之后不再接收「阿杰」的消息（还没见过这个名字，按原样拉黑；名字要和群里显示的一致）', '黑名单：阿杰', '好，又开始接收「阿杰」的消息了', '这个不能拉黑'])
+        self.assertEqual(bot.settings['blocked'], [])
+
+    def test_ordinary_wording_is_not_a_block(self):
+        bot, wx = self.make([{'speak': True, 'to_me': True, 'text': '好的'}])
+        self.tick(bot)
+        self.owner_says(bot, wx, '别听他们瞎说，我们聊点别的', ticks=2)
+        self.assertEqual(bot.settings['blocked'], [])
+        self.assertEqual(wx.sent, [('示例好友', '好的')])
+
+    def test_owner_can_ask_for_memory_now_even_after_a_restart(self):
+        bot, wx = self.make([{'speak': True, 'to_me': True, 'text': '嗯'}])
+        bot.settings.update(aliases=['机器人昵称'])
+        learned = []
+        bot.brain.learn = lambda rows, **kw: learned.append((kw['chat'], len(rows))) or {
+            'people': [{'name': '阿杰', 'facts': ['喜欢打羽毛球'], 'forget': [], 'impression': ''}],
+            'jargon': [], 'style': ''}
+        self.tick(bot)
+        wx.post('示例群甲', '我周末去打羽毛球', sender='阿杰')
+        self.tick(bot, 3)
+        bot.runners['示例群甲'].unlearned = 0  # as after a restart
+        wx.post('示例群甲', '@机器人昵称 总结一下记忆', sender='示例好友')
+        self.tick(bot, 3)
+        self.assertEqual(learned[-1][0], '示例群甲')
+        self.assertIn(('示例群甲', '记住了 1 条新东西'), wx.sent)
+        self.owner_says(bot, wx, '整理记忆', ticks=2)
+        self.assertTrue(wx.sent[-1][1].startswith('「'), wx.sent[-1])
+
+    def test_failed_memory_update_is_reported(self):
+        bot, wx = self.make()
+
+        def fail(rows, **kw):
+            raise ValueError('模型输出被截断')
+
+        bot.brain.learn = fail
+        self.tick(bot)
+        self.owner_says(bot, wx, '今天好累')
+        self.owner_says(bot, wx, '总结记忆')
+        self.assertEqual(wx.sent[-1], ('示例好友', '「示例好友」这次没整理好记忆：模型输出被截断'))

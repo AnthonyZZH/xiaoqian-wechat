@@ -4,14 +4,15 @@ from __future__ import annotations
 import difflib
 import json
 import random
+import re
 import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from brain import mentions, wants_silence
+from brain import EMOJI_REPEAT_REPLIES, mentions, recent_wechat_emojis, wants_silence
 from memory import Memory
-from stickers import PLACEHOLDER_WORDS
+from stickers import PLACEHOLDER_WORDS, WECHAT_EMOJI
 
 # A short reply ending on one of these is a cut-off thought ("你发了个"), not a message.
 DANGLING = tuple("个把给跟与被让对向从和在将的了")
@@ -28,10 +29,29 @@ from routing import preview_text, recipients
 NEVER = float("inf")
 NOTICE_CHARS = 500  # agent receipts and reports may be longer than a chat reply, never multi-line
 IMAGE_CACHE = []  # (fingerprint, description), shared by every chat in this process
+SMALL_EMOJI = re.compile(r"\[([^\[\]]{1,6})\]")
+SMALL_EMOJI_NAMES = frozenset(WECHAT_EMOJI)
 
 
 def compact(text):
     return "".join(str(text).split())
+
+
+def limit_small_emojis(text, blocked=()):
+    """Keep at most one fresh WeChat small emoji; remove recent/repeated ones."""
+    blocked, kept = set(blocked), False
+
+    def replace(match):
+        nonlocal kept
+        name = match.group(1)
+        if name not in SMALL_EMOJI_NAMES:
+            return match.group(0)
+        if name in blocked or kept:
+            return ""
+        kept = True
+        return match.group(0)
+
+    return " ".join(SMALL_EMOJI.sub(replace, str(text)).split())
 
 
 def signature(row):
@@ -76,6 +96,8 @@ class Runner:
         # None when it is ordinary chat, else {"log": text without the passphrase,
         # "reply": receipt or None}. Receipts and reports wait in `notices`.
         self.agent_command = lambda text, act=True: None
+        # The owner's low-risk commands inside a group ("@小千 拉黑 X"), same contract.
+        self.group_command = lambda text, act=True: None
         self.notices = deque()
         self.replaying = False  # set by ingest(replay=True): pause-time messages are never acted on
         self.mode = settings.chat_mode(chat) or outbound_mode
@@ -216,12 +238,23 @@ class Runner:
                 if handled.get("reply"):
                     self.notices.append(handled["reply"])
                 return True
+        sender = getattr(row, "sender", "")
+        if self.blocked(sender):
+            return False  # the owner said not to take in this person's messages at all
+        owner = self.config.get("owner", "")
+        if self.mode == "group" and owner and sender == owner and getattr(row, "image", None) is None:
+            handled = self.group_command(row.text, act=not self.replaying)
+            if handled:
+                self.history.append({"role": "user", "text": handled["log"], "sender": sender})
+                self.emit("received", f"{sender}：{handled['log']}")
+                if handled.get("reply"):
+                    self.notices.append(handled["reply"])
+                return True
         if getattr(row, "image", None) is not None:
             if self.own_sticker(row.image):
                 return False
             row.text = self.describe(row)
         entry = {"role": "user", "text": row.text}
-        sender = getattr(row, "sender", "")
         if self.mode == "group" and sender:
             entry["sender"] = sender
         self.history.append(entry)
@@ -274,6 +307,15 @@ class Runner:
         if not isinstance(result, dict) or not isinstance(result.get("speak"), bool):
             raise ValueError("模型返回格式错误")
         text = " ".join(str(result.get("text") or "").split())
+        if self.stickers:
+            # The model sometimes echoes the sticker's number into the text ("…[奸笑] 049").
+            ids = {sid for sid, _ in self.stickers.catalog(1000)}
+            ids |= {sid.split("_")[0] for sid in ids}
+            match = re.search(r"\s*\b([0-9A-Za-z_]+)\s*$", text)
+            if match and match.group(1) in ids:
+                text = text[:match.start()]
+        blocked = recent_wechat_emojis(self.history, EMOJI_REPEAT_REPLIES)
+        text = limit_small_emojis(text, blocked)
         recent = [compact(r["text"]) for r in self.history[-8:] if r["role"] == "assistant"]
         # Near-repeats too: a reworded copy of the last joke reads as a bot.
         def repeats(old, new=compact(text)):
@@ -302,6 +344,11 @@ class Runner:
             low, high = self.config["proactive_after_seconds"]
             self.next_proactive = self.last_send + random.uniform(low, high)
         self.save()
+
+    def blocked(self, sender):
+        """Blocked by the owner: the sender in a group, or the other side of a private chat."""
+        names = set(self.config.get("blocked") or []) - {self.config.get("owner", "")}
+        return (sender in names) if self.mode == "group" else (self.chat in names)
 
     def is_owner(self):
         return self.mode == "private" and self.chat == self.config.get("owner", "")
@@ -355,11 +402,12 @@ class Runner:
         if any(changed):
             self.save()
 
-    def say(self, text, why="主人让我说的", limit=None):
+    def say(self, text, why="主人让我说的", limit=None, at=()):
         """Send `text` in this chat without asking the model (owner relay, agent notices).
 
         Same rules as any send: only while running, never retried, pause on doubt.
-        `limit` raises the length cap for agent notices only.
+        `limit` raises the length cap for agent notices only. `at` (groups only) are @-ed
+        for real; returns those WeChat could not pick, which went out as plain "@name".
         """
         text = " ".join(str(text).split())
         if not text or len(text) > (limit or self.config["max_reply_chars"]):
@@ -371,21 +419,25 @@ class Runner:
         def cancel():
             return self.stop.is_set() or not self.enabled.is_set() or self.enabled.epoch != epoch
 
+        at = list(at) if self.mode == "group" else []
         self.recent_sends.append((time.monotonic(), compact(text)))
         try:
-            self.adapter.send(text, cancel=cancel, **({"max_chars": limit} if limit else {}))
+            missing = self.adapter.send(text, cancel=cancel, **({"max_chars": limit} if limit else {}),
+                                        **({"at": at} if at else {})) or []
         except Exception:
             self.enabled.clear()
             self.emit("error", "转告发送未确认，已暂停。请检查微信，避免重复。")
             raise
-        self.sent(text, proactive=True)
+        shown = "".join(f"@{m} " for m in at) + text
+        self.sent(shown, proactive=True)
         self.status(f"已在「{self.chat}」说了（{why}）")
+        return missing
 
     def deliver(self):
         """Send notices oldest first; retry only failures known to occur before the click."""
         from wechat_adapter import SendUncertain
 
-        while self.notices and self.is_owner():
+        while self.notices:  # the owner's chat, or a group where the owner gave a command
             try:
                 self.say(self.notices[0], "任务回执", limit=NOTICE_CHARS)
             except (SendUncertain, ValueError):
@@ -441,24 +493,34 @@ class Runner:
         Runs between conversations (never with a reply pending) so it does not
         delay answers; a failure is only retried later and never pauses the bot.
         """
-        if not self.config["memory_enabled"] or self.pending or not self.unlearned:
+        self.learn_note = "记忆功能已关闭"
+        if not self.config["memory_enabled"]:
             return False
-        due = (self.unlearned >= self.config["memory_every"] and now - self.last_incoming >= 30) \
-            or self.unlearned >= 40
-        if not (force or due) or now - self.learn_failed_at < 120:
+        if not force:
+            if self.pending or not self.unlearned:
+                return False
+            due = (self.unlearned >= self.config["memory_every"] and now - self.last_incoming >= 30) \
+                or self.unlearned >= 40
+            if not due or now - self.learn_failed_at < 120:
+                return False
+        # Forced (by the owner): the recent chat even after a restart, which resets `unlearned`.
+        rows = self.history[-min(40, max(self.unlearned + 6, 30 if force else 12)):]
+        if not rows:
+            self.learn_note = "这里还没有聊天记录可整理"
             return False
-        rows = self.history[-min(40, max(self.unlearned + 6, 12)):]
         names = [self.chat] if self.mode == "private" else [r["sender"] for r in rows if r.get("sender")]
         self.status("整理记忆中…")
         try:
             update = self.brain.learn(rows, chat=self.chat, mode=self.mode, memory=self.memory)
         except Exception as exc:
             self.learn_failed_at = now
-            self.status(f"这次没整理好记忆，稍后再试：{str(exc)[:60]}")
+            self.learn_note = f"这次没整理好记忆：{str(exc)[:60]}"
+            self.status(self.learn_note)
             return False
         changed = self.memory.apply(update, names)
         self.unlearned = 0
-        self.status(f"记住了 {changed} 条新东西" if changed else "这段聊天没什么要记的")
+        self.learn_note = f"记住了 {changed} 条新东西" if changed else "这段聊天没什么要记的"
+        self.status(self.learn_note)
         return True
 
     def may_proactive(self, now):

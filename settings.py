@@ -37,6 +37,7 @@ DEFAULTS = {
     "describe_images": True,
     # Sending stickers pastes an image file; keep off until verified on this WeChat build.
     "stickers_enabled": False,
+    "sticker_every": 2,  # strongly suggest a suitable image after this many plain assistant messages
     "web_search": True,
     "collect_stickers": True,  # save stickers others send into the inbox for review
     # The bot account's own WeChat nickname(s); "@机器人昵称" in a group counts as calling her.
@@ -47,6 +48,8 @@ DEFAULTS = {
     "agents_enabled": True,
     "agent_passphrase": "",  # empty: no passphrase needed
     "agent_overrides": {},   # fields over agents.default_configs(), e.g. {"codex": {"model": "…"}}
+    # Names whose messages she no longer takes in, in any chat ("拉黑 小李" from the owner).
+    "blocked": [],
 }
 
 

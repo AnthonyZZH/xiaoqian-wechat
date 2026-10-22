@@ -29,6 +29,7 @@ class SettingsTests(Temp):
         self.assertEqual(settings.chat_mode('示例好友'), 'private')
         self.assertEqual(settings['batch_seconds'], 6)
         self.assertEqual(settings['model']['key'], 'your-local-model')
+        self.assertEqual(settings['sticker_every'], 2)
         self.assertIsNone(settings.chat_mode('别人'))
 
     def test_update_persists(self):

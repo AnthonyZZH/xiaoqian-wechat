@@ -23,6 +23,9 @@ class SendUncertain(RuntimeError):
     """The send button was clicked, but WeChat did not confirm the outcome."""
 
 
+MENTION_CHIP = "￼"  # how the input box reports a picked @member
+
+
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _user32.WindowFromPoint.argtypes = [wintypes.POINT]
 _user32.WindowFromPoint.restype = wintypes.HWND
@@ -448,15 +451,88 @@ class WeChatAdapter:
             raise SendUncertain("发送结果不确定，不自动重试；请查看微信")
         self.restore(previous)
 
-    def send(self, text: str, cancel=lambda: False, max_chars=None):
-        """`max_chars` raises the limit for one message (agent reports); chat replies keep the default."""
+    def send(self, text: str, cancel=lambda: False, max_chars=None, at=()):
+        """`max_chars` raises the limit for one message (agent reports); chat replies keep the default.
+
+        `at`: group members to @ for real, picked from WeChat's member popover before the text.
+        Returns the members that could not be picked; they are written as plain "@name" instead.
+        """
         if not text or "\n" in text or len(text) > (max_chars or self.max_chars):
             raise RuntimeError("回复内容超出长度限制")
         edit, previous = self.focus_input(cancel)
-        edit.GetValuePattern().SetValue(text, waitTime=0)
-        if not self.wait_for(lambda: self.input_value(edit).strip() == text, 1.0) or cancel():
-            raise RuntimeError("草稿核对失败，未点击发送；请手动检查输入框")
+        if not at:
+            edit.GetValuePattern().SetValue(text, waitTime=0)
+            if not self.wait_for(lambda: self.input_value(edit).strip() == text, 1.0) or cancel():
+                raise RuntimeError("草稿核对失败，未点击发送；请手动检查输入框")
+            self.press_send(edit, cancel, previous)
+            return []
+        try:
+            picked = [m for m in at if self.mention(edit, m, cancel) or self.mention(edit, m, cancel)]
+            missing = [m for m in at if m not in picked]
+            body = "".join(f"@{m} " for m in missing) + text
+            saved = clipboard_text()
+            try:
+                set_clipboard_text(body)
+                auto.SendKeys("{Ctrl}v", waitTime=0.05)
+                pasted = self.wait_for(lambda: self.input_value(edit).rstrip().endswith(body.rstrip()), 1.5)
+            finally:
+                set_clipboard_text(saved)
+            value = self.input_value(edit)
+            if not pasted or cancel() or value.count(MENTION_CHIP) != len(picked):
+                raise RuntimeError("艾特后的草稿核对失败，未点击发送")
+        except Exception:
+            # Nothing was clicked yet: leave no half-typed @ behind for the next send to trip over.
+            try:
+                edit.SendKeys("{Ctrl}a{Del}", waitTime=0.05)
+            except Exception:
+                pass
+            raise
         self.press_send(edit, cancel, previous)
+        return missing
+
+    def mention(self, edit, member, cancel):
+        """Type "@name" and pick exactly `member` in WeChat's member popover (the pyweixin way).
+
+        WeChat only opens the popover for typed text, matches loosely, and stops at spaces and
+        emoji, so we type the part before them and then walk the list to the exact name.
+        """
+        typed = "".join(ch for ch in member if ord(ch) < 0x10000).split(" ")[0] or member
+        edit.SendKeys("@" + typed, interval=0.03, waitTime=0.1)
+
+        def back_out():
+            edit.SendKeys("{Back}" * (len(typed) + 1), waitTime=0.05)
+            return False
+
+        popover = self.window.WindowControl(AutomationId="MentionPopover", searchDepth=30)
+        if cancel() or not self.wait_for(lambda: popover.Exists(0, 0), 2.0):
+            return back_out()
+        listing = popover.ListControl(searchDepth=6)
+        if not listing.Exists(0.3):
+            return back_out()
+
+        def selected():
+            for item in listing.GetChildren():
+                try:
+                    if item.GetSelectionItemPattern().IsSelected:
+                        return item.Name
+                except Exception:
+                    continue
+            return None
+
+        if not self.wait_for(lambda: selected() is not None, 1.5):  # the list fills in after the popover
+            return back_out()
+        first = selected()
+        chips = self.input_value(edit).count(MENTION_CHIP)
+        for _ in range(60):
+            if selected() == member:
+                edit.SendKeys("{Enter}", waitTime=0.1)
+                # WeChat 4.1 turns a picked @ into one embedded object (U+FFFC), not "@name" text.
+                return self.wait_for(lambda: not popover.Exists(0, 0)
+                                     and self.input_value(edit).count(MENTION_CHIP) == chips + 1, 1.0)
+            auto.SendKeys("{Down}", waitTime=0.05)
+            if selected() in (first, None):
+                break
+        return back_out()  # deleting "@typed" also closes the popover
 
     def send_image(self, path, cancel=lambda: False):
         """Paste an image file into the input box and send it. Restores clipboard text."""

@@ -34,9 +34,17 @@ OWNER_SEND = re.compile(r"(?:你)?(?:去|帮我|再)?(?:给|跟|向|对)\s*(?P<c
                         r"(?:发消息|发个消息|发一句|发|说)\s*(?:说)?\s*[:：]\s*(?P<text>\S.*)")
 # "在测试群里艾特小王说：…" / "去测试群说：…": a group (short names allowed), optionally @someone.
 OWNER_SAY_IN = re.compile(r"(?:你)?(?:帮我|再)?(?:在|到|去|往)\s*(?P<chat>[^\s:：,，]{1,40}?)\s*(?:里面|里|中)?\s*"
-                          r"(?:(?:艾特|@|＠)\s*(?P<at>[^\s:：,，]{1,30}?)\s*)?"
+                          r"(?:(?:艾特|爱特|@|＠)\s*(?P<at>[^\s:：,，]{1,30}?)\s*[,，]?\s*)?"
                           r"(?:发消息|发个消息|发一句|发|说)\s*(?:说)?\s*[:：]\s*(?P<text>\S.*)")
 NOT_A_CHAT = {"我", "你", "他", "她", "它", "大家", "我们", "你们", "他们"}
+# The owner's low-risk commands, also accepted in a group when they @ her.
+UNBLOCK = re.compile(r"(?:解除拉黑|取消拉黑|解除屏蔽|取消屏蔽|恢复接收|可以接收|可以理|放出)\s*(?P<name>.+?)\s*(?:的消息|的话|了)?[。.!！]*")
+BLOCK = re.compile(r"(?:(?:不允许|不准|不许|不要|别)再?(?:接收|接受|理|回复|回|搭理|听)|拉黑|屏蔽)\s*"
+                   r"(?P<name>.+?)\s*(?:的消息|的话|发的消息)?[。.!！]*")
+BLOCKLIST = re.compile(r"(?:看看|查看)?(?:黑名单|拉黑名单|屏蔽名单)[?？]*")
+LEARN_NOW = re.compile(r"(?:总结|整理|更新|保存|存)一?下?(?:你的|一下)?记忆[。.!！~～]*|记一下(?:刚才的?)?(?:聊天)?[。.!！]*")
+# Worth asking the local model whether the owner wants something sent (free wording only).
+SEND_HINT = re.compile(r"艾特|爱特|@|＠|转告|告诉|通知|招呼|问问|(?:给|跟|向|对|在|去|到).{0,20}?(?:发|说|讲|问)")
 
 
 class Enabled:
@@ -121,6 +129,7 @@ class Bot:
             runner.relay_targets = lambda: [c for c in self.settings["chats"] if c != self.settings["owner"]]
             runner.should_yield = lambda r=runner: self.higher_priority(r)
             runner.agent_command = self.agent_command
+            runner.group_command = self.group_command
             runner.context = lambda: "\n".join(
                 r.digest() for c, r in self.runners.items() if c in groups() and r.digest())
             self.runners[chat] = runner
@@ -175,12 +184,14 @@ class Bot:
         return next_chat is not None and self.incoming.priority(next_chat, chats, owner, self.runners.get(next_chat)) \
             < self.incoming.priority(runner.chat, chats, owner, runner)
 
-    def send_relay(self, chat, text, why="主人让我说的", limit=None):
-        """One exact recipient, no model call in the destination, no fallback chat."""
+    def send_relay(self, chat, text, why="主人让我说的", limit=None, at=()):
+        """One exact recipient, no model call in the destination, no fallback chat.
+
+        Returns the `at` members WeChat could not pick (sent as plain "@name")."""
         source = self.runner.chat
         try:
             self.go(chat, outbound=True)
-            self.runner.say(text, why, limit)
+            missing = self.runner.say(text, why, limit, at) or []
             self.emit("status", f"已向「{chat}」转告" if limit is None else f"已在「{chat}」发出{why}")
         finally:
             # Reading or model inference in the recipient chat must not accidentally
@@ -190,6 +201,7 @@ class Bot:
             except Exception:
                 self.enabled.clear()
                 self.emit("error", "无法返回原聊天，已暂停；不会向其他聊天继续发送")
+        return missing
 
     def watch(self):
         """Preserve every changed session; owner, then private chats, then groups."""
@@ -220,6 +232,8 @@ class Bot:
         if current != owner and owner_runner and owner_runner.notices:
             self.reports[0:0] = list(owner_runner.notices)
             owner_runner.notices.clear()
+        if current != owner and runner.notices:
+            return  # a reply to the owner's command in this group: step() sends it here
         if current == owner:
             if self.reports:
                 runner.notices.extend(self.reports)
@@ -248,20 +262,24 @@ class Bot:
             return
         # The open chat's own waiting entry must not hold back what it asked for (single-chat mode).
         if self.relays and (chat is None or chat == current or priority(chat) > 0):
-            # Owner sends carry a third item: the exact text, any chat, and a truthful report back.
-            target, text, *exact = self.relays.pop(0)
+            # Owner sends carry a third item, the members to @: the exact text, any chat,
+            # and a truthful report back.
+            target, text, *owner_send = self.relays.pop(0)
+            at = list(owner_send[0]) if owner_send else []
             from runner import NOTICE_CHARS
             from wechat_adapter import SendUncertain
             try:
-                self.send_relay(target, text, *(("主人让我发的", NOTICE_CHARS) if exact else ()))
+                missing = self.send_relay(target, text, *(("主人让我发的", NOTICE_CHARS, at) if owner_send else ()))
             except Exception as exc:
                 self.emit("error", f"向「{target}」转告失败：{exc}；没有改发到其他聊天")
-                if exact:
+                if owner_send:
                     self.reports.append(f"发给「{target}」的结果不确定，没有重发，请看一下微信" if isinstance(exc, SendUncertain)
                                         else f"没发给「{target}」：{exc}")
             else:
-                if exact:
-                    self.reports.append(f"已发给「{target}」：{text[:60] + '…' if len(text) > 60 else text}")
+                if owner_send:
+                    shown = "".join(f"@{m} " for m in at) + text
+                    note = f"（群成员里没找到 {'、'.join(missing)}，按文字写的 @）" if missing else ""
+                    self.reports.append(f"已发给「{target}」：{shown[:60] + '…' if len(shown) > 60 else shown}{note}")
             return
         if not self.settings["multi_chat"] or chat is None:
             if current in excluded and not runner.initialized:
@@ -295,20 +313,99 @@ class Bot:
         With act=False (messages from a pause) nothing is sent, started or stopped.
         """
         line = " ".join(str(text).split())
+        handled = self.owner_command(line, act, here=None)
+        if handled:
+            return handled
         send = OWNER_SEND.fullmatch(line) or OWNER_SAY_IN.fullmatch(line)
         if send and send["chat"] not in NOT_A_CHAT and send["chat"].casefold() not in AGENT_ALIASES:
-            if act:
-                chat, body = self.resolve_chat(send["chat"]), send["text"]
-                if send.groupdict().get("at"):
-                    body = f"@{send['at']} {body}"  # plain text: WeChat does not notify like a picked @
-                if chat is None:
-                    self.reports.append(f"「{send['chat']}」能对上好几个聊天，没发。请写完整的聊天名")
-                else:
-                    # Confirmed (or not) by a report once it has really been tried; never claimed early.
-                    self.relays.append((chat, body, True))
+            if not act:
+                return {"log": line, "reply": None}
+            at = send.groupdict().get("at")
+            at = [self.settings["owner"] if at == "我" else at] if at else []
+            if send["chat"] in ("群", "群聊"):  # "在群里艾特我，说：…": fine only while there is one group
+                groups = [c for c, info in self.settings["chats"].items() if info["mode"] == "group"]
+                if len(groups) != 1:
+                    return {"log": line, "reply": "要发到哪个群？请写群名，例如“在示例群甲里说：…”"}
+                self.queue_owner_send(groups[0], send["text"], at)
+            else:
+                self.queue_owner_send(self.resolve_chat(send["chat"]), send["text"], at, send["chat"])
             return {"log": line, "reply": None}
-        if not self.settings["agents_enabled"]:
+        handled = self.agent_task(text, line, act) if self.settings["agents_enabled"] else None
+        if handled or not act or not SEND_HINT.search(line):
+            return handled
+        # Free wording ("在群里艾特我，说：测试一下"): the local model only extracts the
+        # request; the recipient is still checked here and the result reported truthfully.
+        try:
+            wish = self.brain.parse_send(line, chats=self.settings["chats"], owner=self.settings["owner"],
+                                         members=self.chat_members, jargon=self.chat_jargon)
+        except Exception as exc:
+            self.emit("error", f"没能理解这句是不是要代发：{exc}")
             return None
+        if not (isinstance(wish, dict) and wish.get("send") is True):
+            return None
+        return {"log": line, "reply": self.owner_send_from(line, wish)}
+
+    def group_command(self, text, act=True):
+        """The owner in a group, addressing her: only blocking and memory, never sends or agents.
+
+        Group sender names come from OCR and avatars, so anything that reaches other chats or
+        runs programs stays in the owner's private chat.
+        """
+        names = [self.runner.name] + [a for a in self.settings.get("aliases") or [] if a]
+        line = " ".join(str(text).replace(" ", " ").split())
+        called = [n for n in names if f"@{n}" in line]
+        if not called:
+            return None
+        for n in called:
+            line = line.replace(f"@{n}", " ")
+        return self.owner_command(" ".join(line.split()), act, here=self.runner, log=" ".join(str(text).split()))
+
+    def owner_command(self, line, act, here=None, log=None):
+        """拉黑 / 解除拉黑 / 黑名单 / 总结记忆. `here`: the group it was said in, else the owner's chat."""
+        log = log or line
+        if BLOCKLIST.fullmatch(line):
+            blocked = self.settings.get("blocked") or []
+            return {"log": log, "reply": ("黑名单：" + "、".join(blocked) if blocked else "黑名单是空的") if act else None}
+        if LEARN_NOW.fullmatch(line):
+            return {"log": log, "reply": self.learn_now(here) if act else None}
+        match = UNBLOCK.fullmatch(line) or BLOCK.fullmatch(line)
+        if not match:
+            return None
+        name = match["name"].strip(" @＠「」“”\"'")
+        bot = [self.runner.name] + list(self.settings.get("aliases") or [])
+        if not name or name in NOT_A_CHAT or len(name) > 40:
+            return None
+        seen = name in self.settings["chats"] or any(name in self.chat_members(c) for c in self.settings["chats"])
+        if match.re is BLOCK and not (seen or "@" in match["name"] or "拉黑" in line or "屏蔽" in line):
+            return None  # "不要回复太长的消息" is chat, not a block: an unknown name needs 拉黑 or @
+        if not act:
+            return {"log": log, "reply": None}
+        blocked = list(self.settings.get("blocked") or [])
+        if match.re is UNBLOCK:
+            if name not in blocked:
+                return {"log": log, "reply": f"「{name}」本来就不在黑名单里"}
+            self.settings.update(blocked=[n for n in blocked if n != name])
+            return {"log": log, "reply": f"好，又开始接收「{name}」的消息了"}
+        if name == self.settings["owner"] or name in bot:
+            return {"log": log, "reply": "这个不能拉黑"}
+        if name not in blocked:
+            self.settings.update(blocked=blocked + [name])
+        for runner in self.runners.values():  # already waiting for a reply: drop those too
+            runner.pending[:] = [m for m in runner.pending if not runner.blocked(getattr(m, "sender", ""))]
+        return {"log": log, "reply": f"好，之后不再接收「{name}」的消息"
+                + ("" if seen else "（还没见过这个名字，按原样拉黑；名字要和群里显示的一致）")}
+
+    def learn_now(self, here=None):
+        """The owner asked for memory to be updated now: this group, or every chat she has open."""
+        runners = [here] if here else [r for r in self.runners.values() if r.history]
+        notes = []
+        for runner in runners:
+            runner.learn(time.monotonic(), force=True)
+            notes.append(runner.learn_note if here else f"「{runner.chat}」{runner.learn_note}")
+        return "；".join(notes) or "还没有聊天记录可整理"
+
+    def agent_task(self, text, line, act):
+        """“任务”, “停掉 codex”, “给claude …”; None for anything else."""
         if line.rstrip("?？。!！") in ("任务", "任务列表"):
             return {"log": line, "reply": self.job_list() if act else None}
         match = re.fullmatch(r"(?:停掉|停止|停下)\s*[:：,，]?\s*([^\s的]+)(?:\s*的?任务)?", line)
@@ -320,6 +417,69 @@ class Bot:
             return None
         agent, task = parsed
         return {"log": f"给{agent} {' '.join(task.split())}", "reply": self.dispatch(agent, task) if act else None}
+
+    def queue_owner_send(self, chat, text, at, asked=None):
+        """Queue one owner send; it is reported once really tried, never claimed early."""
+        if chat is None:
+            self.reports.append(f"「{asked}」能对上好几个聊天，没发。请写完整的聊天名")
+            return
+        self.relays.append((chat, text, tuple(m for m in at if m)))
+
+    def owner_send_from(self, line, wish):
+        """Check what the model read out of free wording before anything is sent.
+
+        The chat must be a watched chat or a name the owner actually typed; @ targets must be
+        typed by the owner, be the owner ("我"), or be a member already seen in that group.
+        Returns a question for the owner when it is not clear, else None (a report follows).
+        """
+        from runner import NOTICE_CHARS
+        chats = self.settings["chats"]
+        named = " ".join(str(wish.get("chat") or "").split())
+        groups = [c for c, info in chats.items() if info["mode"] == "group"]
+        # Only a chat the owner named (in full or as a short "X群"), or the only group there is.
+        shorts = {line[i - k:i + 1] for i, ch in enumerate(line) if ch == "群" for k in range(2, 11) if i >= k}
+        core = named[:-1] if named.endswith("群") else named
+        typed = named in line or (len(core) >= 2 and core in line) \
+            or any(self.resolve_chat(short) == named for short in shorts)
+        chat = self.resolve_chat(named) if named and typed else None
+        if chat is None and len(groups) == 1 and (not named or named == groups[0]) \
+                and re.search(r"群|艾特|爱特|@|＠", line):
+            chat = groups[0]
+        text = " ".join(str(wish.get("text") or "").split())
+        if not chat:
+            return "要发到哪个聊天？请写完整的聊天名，例如“在示例测试群里说：…”"
+        if not text or len(text) > NOTICE_CHARS:
+            return f"要在「{chat}」说什么？请把原话写在冒号后面"
+        known = set(self.chat_members(chat))
+        at, unsure = [], []
+        for name in wish.get("at") or []:
+            name = " ".join(str(name).split()).lstrip("@＠")
+            ok = name and (name in line or name in known or (name == self.settings["owner"] and "我" in line))
+            (at if ok else unsure).append(name)
+        if unsure:
+            return f"没认出要艾特的「{'、'.join(unsure)}」是群里的谁，没发。请写群里显示的名字"
+        self.queue_owner_send(chat, text, at)
+        return None
+
+    def chat_members(self, chat):
+        """Names already seen in a group (sender book, roster), for checking @ targets."""
+        from personas import safe_name
+        names = list((self.settings["chats"].get(chat) or {}).get("roster") or [])
+        try:
+            book = json.loads((self.data / "senders" / f"{safe_name(chat)}.json").read_text(encoding="utf-8"))
+            names += [n for entry in book for n in (entry.get("names") or {})]
+        except Exception:
+            pass
+        return list(dict.fromkeys(n for n in names if n))
+
+    def chat_jargon(self, chat):
+        """The group's nicknames and slang from memory ("小王 / 老赵：…对应 小李"), as lines."""
+        from personas import safe_name
+        try:
+            data = json.loads((self.data / "memory" / f"{safe_name(chat)}.json").read_text(encoding="utf-8"))
+            return [f"{term}：{entry.get('meaning', '')}" for term, entry in (data.get("jargon") or {}).items()][:60]
+        except Exception:
+            return []
 
     def resolve_chat(self, name):
         """A watched chat the owner named in short ("测试群" → "示例测试群"), else `name` as typed.
