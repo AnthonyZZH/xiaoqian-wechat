@@ -145,14 +145,19 @@ def now_line() -> str:
             f"星期{'一二三四五六日'[now.weekday()]} {now:%H:%M}（{now.tzname()}）。")
 
 
+# 没话找话 (her own follow-up or opening) starts something new instead of carrying the last thread on.
+NEW_TOPIC = ("不要顺着聊天记录里刚才的话往下说，也不要补充、总结或重复之前的话题；"
+             "聊天记录只用来了解对方、避开已经聊过的东西。")
+
+
 def situation(mode: str, proactive: bool, mentioned: bool, continuing: bool = False) -> str:
     return now_line() + _situation(mode, proactive, mentioned, continuing)
 
 
 def _situation(mode: str, proactive: bool, mentioned: bool, continuing: bool = False) -> str:
     if proactive:
-        return ("现在考虑主动接一句。只有最近有值得延续的话题时才说，否则保持沉默。对方没有回应时绝不连续发第二次。"
-                "别说你怎么不理我、在吗或早安晚安。提出新的关联、轻巧的问题或补充，不重复上一句的笑点。")
+        return ("现在考虑主动说一句。" + NEW_TOPIC + "要说就开一个和刚才无关的新话题，"
+                "没有好的新话题就保持沉默。对方没有回应时绝不连续发第二次。别说你怎么不理我、在吗或早安晚安。")
     if mode == "group":
         if mentioned:
             return "有人点了你的名或@了你，通常要接一下。"
@@ -175,12 +180,13 @@ def opening_situation(mode: str, idle_minutes: float, unanswered: int = 0) -> st
     """She opens a topic on her own after a quiet spell (a group bubble, or a message to the owner)."""
     idle = f"{idle_minutes / 60:.0f} 个多小时" if idle_minutes >= 90 else f"{max(1, round(idle_minutes))} 分钟"
     if mode == "group":
-        text = (f"群里已经安静了大约{idle}。你可以像一个真实群友那样自己冒个泡：接着之前没聊完的话题、"
-                "说一个跟群里大家的近况或梗有关的想法、问个轻松的问题，或者只发一张合适的表情包。"
+        text = (f"群里已经安静了大约{idle}。你可以像一个真实群友那样自己冒个泡，开一个新话题：" + NEW_TOPIC +
+                "可以说你刚想到或看到的一件事、问大家一个轻松的问题、聊点跟大家的爱好有关的新东西，或者只发一张合适的表情包。"
                 "要像随口一说；不要说“大家好”“有人吗”“好安静啊”，不要自我介绍，不要@所有人。")
     else:
-        text = (f"你们大约{idle}没聊了。像朋友一样主动找他说一句：接着之前的话题、关心他提过的事（看记忆）、"
-                "分享一个想法或问个轻松的问题，可以结合现在的时间（饭点、深夜、周末）。"
+        text = (f"你们大约{idle}没聊了。像朋友一样主动找他开一个新话题：" + NEW_TOPIC +
+                "可以从他的爱好、生活（看记忆）找个新角度，分享你刚想到的事，或问个轻松的问题，"
+                "也可以结合现在的时间（饭点、深夜、周末）。"
                 "不要说“在吗”“你怎么不理我”，不要催他回复。")
     if unanswered:
         text += f"你上次主动说的话还没人接（{unanswered} 次），这次要更有内容，没把握就别说。"

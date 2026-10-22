@@ -717,9 +717,11 @@ class AgentBridgeTests(Temp):
         self.tick(bot)
         wx.post('示例群甲', '@机器人昵称 不允许再接收@小李 的消息', sender='示例好友')
         self.tick(bot, 3)
-        self.assertEqual(bot.settings['blocked'], ['小李'])
-        self.assertIn(('示例群甲', '好，之后不再接收「小李」的消息（还没见过这个名字，按原样拉黑；名字要和群里显示的一致）'),
-                      wx.sent)
+        self.assertEqual(bot.settings['blocked'], [{'name': '小李', 'chat': '示例群甲', 'until': None}])
+        self.assertIn(('示例群甲', '好，小李（在「示例群甲」，解封时间：当太阳从西边升起），不再接收他的消息，已经通知他了'
+                                 '（还没见过这个名字，按原样拉黑；名字要和群里显示的一致）'), wx.sent)
+        self.assertIn(('示例群甲', '@小李 你已被拉黑，这段时间我不会再接收你的消息。解封时间：当太阳从西边升起'), wx.sent)
+        self.assertIn(('示例群甲', ('小李',)), wx.mentions)  # a real @
         self.assertEqual(self.prompts, [])
         wx.post('示例群甲', '@机器人昵称 你是人吗', sender='小李')
         self.tick(bot, 3)
@@ -746,7 +748,9 @@ class AgentBridgeTests(Temp):
         self.owner_says(bot, wx, '解除拉黑阿杰')
         self.owner_says(bot, wx, '拉黑示例好友')
         self.assertEqual([t for c, t in wx.sent if c == '示例好友'],
-                         ['好，之后不再接收「阿杰」的消息（还没见过这个名字，按原样拉黑；名字要和群里显示的一致）', '黑名单：阿杰', '好，又开始接收「阿杰」的消息了', '这个不能拉黑'])
+                         ['好，阿杰（所有聊天，解封时间：当太阳从西边升起），不再接收他的消息'
+                          '（还没见过这个名字，按原样拉黑；名字要和群里显示的一致）',
+                          '黑名单：阿杰（所有聊天，解封时间：当太阳从西边升起）', '好，又开始接收「阿杰」的消息了', '这个不能拉黑'])
         self.assertEqual(bot.settings['blocked'], [])
 
     def test_ordinary_wording_is_not_a_block(self):
@@ -1169,3 +1173,116 @@ class AgentBridgeTests(Temp):
         wx.system_marks = []
         with self.assertRaises(RuntimeError):  # still fail closed when nothing matches at all
             bot.runner_for('示例群甲').prime(wx.read(), baseline='谁也没说过的话')
+
+    def test_a_timed_block_in_one_chat_ends_on_time(self):
+        bot, wx = self.make([{'speak': True, 'to_me': True, 'text': f'回第{n}句'} for n in range(5)])
+        bot.settings.update(aliases=['机器人昵称'])
+        self.tick(bot)
+        self.owner_says(bot, wx, '拉黑 阿杰 2小时', ticks=3)
+        entry, = bot.block_entries()
+        self.assertEqual((entry['name'], entry['chat']), ('阿杰', None))
+        self.assertAlmostEqual(entry['until'] - time.time(), 7200, delta=30)
+        self.assertIn('时长 2 小时', bot.block_label(entry))
+        wx.post('示例群甲', '@机器人昵称 在吗', sender='阿杰')
+        self.tick(bot, 3)
+        self.assertEqual(self.prompts, [])  # blocked
+        bot.settings.update(blocked=[dict(entry, until=time.time() - 1)])  # two hours later
+        self.assertEqual(bot.block_entries(), [])
+        wx.post('示例群甲', '@机器人昵称 现在呢', sender='阿杰')
+        self.tick(bot, 3)
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_console_blocks_a_private_contact_and_tells_them(self):
+        bot, wx = self.make()
+        bot.settings.update(chats={'示例好友': {'mode': 'private'}, '示例群甲': {'mode': 'group'},
+                                   '小王': {'mode': 'private'}})
+        wx.chats['小王'], wx.modes['小王'] = [], 'private'
+        wx.post('小王', '很久以前的私聊')
+        self.tick(bot)
+        bot.handle(('block', '小王', '小王', 30, True))
+        self.tick(bot, 3)
+        self.assertIn('时长 30 分钟', wx.sent[-2][1] if wx.sent[-1][0] == '示例好友' else wx.sent[-1][1])
+        told = [s for c, s in wx.sent if c == '小王']
+        self.assertEqual(len(told), 1)
+        self.assertTrue(told[0].startswith('你已被拉黑'))
+        self.assertTrue(bot.runner_for('小王').blocked(''))
+        self.assertFalse(bot.runner_for('示例群甲').blocked('小王'))  # only that private chat
+        bot.handle(('unblock', '小王', '小王'))
+        self.assertEqual(bot.block_entries(), [])
+
+    def test_older_plain_name_blocks_still_count(self):
+        bot, wx = self.make()
+        bot.settings.update(blocked=['阿杰'])
+        self.assertTrue(bot.runner_for('示例群甲').blocked('阿杰'))
+        self.assertEqual(bot.block_entries(), [{'name': '阿杰', 'chat': None, 'until': None}])
+
+    def test_members_are_one_name_each_without_ocr_slips(self):
+        bot, _ = self.make()
+        (self.dir / 'data' / 'senders').mkdir(parents=True, exist_ok=True)
+        (self.dir / 'data' / 'senders' / '示例群甲.json').write_text(json.dumps([
+            {'hash': '1', 'names': {'测试群友': 36, 'PinkFIyPig': 28, 'PinkHyPig': 1}, 'label': None},
+            {'hash': '2', 'names': {'小李': 80}, 'label': None},
+            {'hash': '3', 'names': {'小李': 2}, 'label': None},
+            {'hash': '4', 'names': {'大口亻尔早口11': 1}, 'label': None},
+            {'hash': '5', 'names': {'ntnon': 1}, 'label': '小王'},
+            {'hash': '6', 'names': {}, 'label': None}]), encoding='utf-8')
+        self.assertEqual(bot.chat_members('示例群甲'), ['测试群友', '小李', '小王'])
+
+    def test_draw_wording_beyond_hua(self):
+        bot, _ = self.make()
+        cases = {'给我生成一张可爱的猫耳娘': '一张可爱的猫耳娘', '生成：赛博朋克城市': '赛博朋克城市',
+                 '给我来一张壁纸': '一张壁纸', '帮我做个PPT': None, '发点奶龙表情包': None, '做个人吧': None,
+                 '画画好难': None}
+        for text, what in cases.items():
+            self.assertEqual(bot.draw_wish(text), what, text)
+
+    def test_the_owner_names_a_member_ocr_cannot_read(self):
+        bot, wx = self.make()
+        (self.dir / 'data' / 'senders').mkdir(parents=True, exist_ok=True)
+        (self.dir / 'data' / 'senders' / '示例群甲.json').write_text(json.dumps([
+            {'hash': '1', 'names': {'小李': 80}, 'label': None},
+            {'hash': '2', 'names': {}, 'label': None}]), encoding='utf-8')
+        bot.runner_for('示例群甲').history = [{'role': 'user', 'text': '嘎嘎嘎', 'sender': '群友2'}]
+        nobody = bot.group_people('示例群甲')[1]
+        self.assertEqual((nobody['name'], nobody['last']), ('群友2', '嘎嘎嘎'))
+        bot.handle(('name_person', '示例群甲', 1, '嘎嘎嘎'))
+        self.assertEqual(bot.group_people('示例群甲')[1]['name'], '嘎嘎嘎')
+        self.assertIn('嘎嘎嘎', bot.chat_members('示例群甲'))
+        from senders import SenderBook
+        book = SenderBook(self.dir / 'data' / 'senders' / '示例群甲.json')
+        self.assertEqual(book.resolve(2, None), '嘎嘎嘎')  # his next bubble is named
+        bot.handle(('name_person', '示例群甲', 1, ''))
+        self.assertEqual(bot.group_people('示例群甲')[1]['name'], '群友2')
+
+    def test_a_private_chat_whose_place_scrolled_away_answers_after_her_last_bubble(self):
+        bot, wx = self.make()
+        bot.settings.update(chats={'示例好友': {'mode': 'private'}, '小赵': {'mode': 'private'},
+                                   '示例群甲': {'mode': 'group'}})
+        wx.chats['小赵'], wx.modes['小赵'] = [], 'private'
+        wx.post('小赵', '[图片]', role='assistant')  # sent from this account by hand
+        wx.post('小赵', '给我生成一张可爱的猫耳娘')
+        wx.open_chat('小赵')
+        wx.set_target('小赵', 'private')
+        runner = bot.runner_for('小赵')
+        runner.prime(wx.read(), baseline='早就滚出屏幕的那句')
+        self.assertEqual([r['text'] for r in runner.history], ['给我生成一张可爱的猫耳娘'])  # taken in
+        with self.assertRaises(RuntimeError):  # groups still fail closed
+            bot.runner_for('示例群甲').prime(wx.read(), baseline='谁也没说过的话')
+
+    def test_resume_takes_in_requests_that_never_reached_her(self):
+        bot, wx = self.make([{'speak': True, 'to_me': True, 'text': '在呢'}])
+        bot.settings.update(chats={'示例好友': {'mode': 'private'}, '小赵': {'mode': 'private'}},
+                            draw_rights={'小赵': {'enabled': True, 'limit': 3}})
+        wx.chats['小赵'], wx.modes['小赵'] = [], 'private'
+        wx.post('小赵', '[图片]', role='assistant')
+        wx.post('小赵', '给我生成一张二次元美少女')
+        wx.post('小赵', '你好')
+        bot.go('小赵')
+        bot.runner.step()  # first visit: everything on screen is old
+        self.assertEqual(bot.runner.history, [])
+        bot.handle(('resume',))
+        self.tick(bot, 4)
+        self.assertIn(('小赵', '好，画好了发出来，大概要一分钟（今天还能画 2 张）'), wx.sent)
+        self.assertIn('你好', [r['text'] for r in bot.runner_for('小赵').history])
+        self.assertEqual(len(bot.agents.jobs()), 1)
+        self.wait_jobs(bot)

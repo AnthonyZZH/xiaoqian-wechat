@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from collections import deque
+from collections import Counter, deque
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
@@ -44,8 +44,23 @@ BLOCK = re.compile(r"(?:(?:不允许|不准|不许|不要|别)再?(?:接收|接�
                    r"(?P<name>.+?)\s*(?:的消息|的话|发的消息)?[。.!！]*")
 BLOCKLIST = re.compile(r"(?:看看|查看)?(?:黑名单|拉黑名单|屏蔽名单)[?？]*")
 # "画一只橘猫" / "帮我画：…": a picture by Codex's image tool, sent back where it was asked for.
-DRAW = re.compile(r"(?P<ask>请|你|帮我|给我|请你|你帮我|你给我)?画(?:一下)?\s*(?P<colon>[:：])?\s*(?P<what>.+)")
+DRAW = re.compile(r"(?P<ask>请|你|帮我|给我|请你|你帮我|你给我)?(?P<verb>画|生成|做|来|整|弄)(?:一下)?\s*"
+                  r"(?P<colon>[:：])?\s*(?P<what>.+)")
+# "生成" is about pictures anyway; 做/来/整/弄 only when the picture is named ("帮我做个PPT" is not).
+PICTURE_WORD = re.compile(r"图|画|头像|壁纸|插画|立绘")
 LEARN_NOW = re.compile(r"(?:总结|整理|更新|保存|存)一?下?(?:你的|一下)?记忆[。.!！~～]*|记一下(?:刚才的?)?(?:聊天)?[。.!！]*")
+DURATION = re.compile(r"\s*(\d+)\s*(分钟|分|个?小时|个?钟头|天)\s*$")
+BLOCK_MINUTES = {"分钟": 1, "分": 1, "小时": 60, "个小时": 60, "钟头": 60, "个钟头": 60, "天": 1440}
+
+
+def split_duration(text):
+    """("小李", 120) from "小李 2小时"; (text, None) when no duration is given."""
+    match = DURATION.search(text)
+    if not match:
+        return text.strip(), None
+    return text[:match.start()].strip(), int(match.group(1)) * BLOCK_MINUTES[match.group(2)]
+
+
 # Worth asking the local model whether the owner wants something sent (free wording only).
 SEND_HINT = re.compile(r"艾特|爱特|@|＠|转告|告诉|通知|招呼|问问|(?:给|跟|向|对|在|去|到).{0,20}?(?:发|说|讲|问)")
 
@@ -504,6 +519,8 @@ class Bot:
         draw = DRAW.fullmatch(line)
         if not draw or not self.settings["agents_enabled"]:
             return None
+        if draw["verb"] not in ("画", "生成") and not PICTURE_WORD.search(draw["what"]):
+            return None
         if draw["ask"] or draw["colon"] or re.match(r"[一两几个张幅只条朵位副]", draw["what"]):
             # "画个戴帽子的狗" is about 戴帽子的狗; 张/幅 stay ("画张风景照").
             return re.sub(r"^个\s*(?=\S)", "", draw["what"])
@@ -548,8 +565,9 @@ class Bot:
         if what is not None:  # the owner: no daily allowance
             return {"log": log, "reply": self.draw(what, here) if act else None}
         if BLOCKLIST.fullmatch(line):
-            blocked = self.settings.get("blocked") or []
-            return {"log": log, "reply": ("黑名单：" + "、".join(blocked) if blocked else "黑名单是空的") if act else None}
+            entries = self.block_entries()
+            listing = "；".join(self.block_label(e) for e in entries)
+            return {"log": log, "reply": (f"黑名单：{listing}" if entries else "黑名单是空的") if act else None}
         if LEARN_NOW.fullmatch(line):
             return {"log": log, "reply": self.learn_now(here) if act else None}
         match = UNBLOCK.fullmatch(line) or BLOCK.fullmatch(line)
@@ -564,20 +582,68 @@ class Bot:
             return None  # "不要回复太长的消息" is chat, not a block: an unknown name needs 拉黑 or @
         if not act:
             return {"log": log, "reply": None}
-        blocked = list(self.settings.get("blocked") or [])
         if match.re is UNBLOCK:
-            if name not in blocked:
-                return {"log": log, "reply": f"「{name}」本来就不在黑名单里"}
-            self.settings.update(blocked=[n for n in blocked if n != name])
-            return {"log": log, "reply": f"好，又开始接收「{name}」的消息了"}
+            gone = self.unblock(name, here.chat if here else None)
+            return {"log": log, "reply": f"好，又开始接收「{name}」的消息了" if gone else f"「{name}」本来就不在黑名单里"}
         if name == self.settings["owner"] or name in bot:
             return {"log": log, "reply": "这个不能拉黑"}
-        if name not in blocked:
-            self.settings.update(blocked=blocked + [name])
+        name, minutes = split_duration(name)
+        # From a group: in that group. From the owner's chat: everywhere.
+        reply = self.block(name, here.chat if here else None, minutes)
+        return {"log": log, "reply": reply + ("" if seen else "（还没见过这个名字，按原样拉黑；名字要和群里显示的一致）")}
+
+    def block_entries(self):
+        """Blocks still in force, as {name, chat, until}; expired ones are dropped from settings."""
+        now, entries = time.time(), []
+        for entry in self.settings.get("blocked") or []:
+            entry = {"name": entry} if isinstance(entry, str) else dict(entry)
+            entry = {"name": entry.get("name"), "chat": entry.get("chat") or None, "until": entry.get("until")}
+            if entry["name"] and (entry["until"] is None or entry["until"] > now):
+                entries.append(entry)
+        if len(entries) != len(self.settings.get("blocked") or []):
+            self.settings.update(blocked=entries)
+        return entries
+
+    @staticmethod
+    def block_span(until):
+        if until is None:
+            return "解封时间：当太阳从西边升起"
+        minutes = max(1, round((until - time.time()) / 60))
+        span = f"{minutes // 1440} 天" if minutes >= 1440 and minutes % 1440 == 0 else \
+            f"{minutes // 60} 小时" if minutes >= 60 and minutes % 60 == 0 else f"{minutes} 分钟"
+        return f"时长 {span}，{datetime.fromtimestamp(until):%m-%d %H:%M} 解封"
+
+    def block_label(self, entry):
+        where = f"在「{entry['chat']}」" if entry["chat"] and entry["chat"] != entry["name"] else \
+            "私聊" if entry["chat"] else "所有聊天"
+        return f"{entry['name']}（{where}，{self.block_span(entry['until'])}）"
+
+    def block(self, name, chat=None, minutes=None, notify=True):
+        """Stop taking in `name`'s messages in `chat` (None: everywhere) for `minutes` (None: for good).
+
+        The person is told once, in that chat (a group member is @-ed), how long it lasts.
+        Returns a line for the owner."""
+        until = time.time() + minutes * 60 if minutes else None
+        entries = [e for e in self.block_entries() if not (e["name"] == name and e["chat"] == chat)]
+        entries.append({"name": name, "chat": chat, "until": until})
+        self.settings.update(blocked=entries)
         for runner in self.runners.values():  # already waiting for a reply: drop those too
             runner.pending[:] = [m for m in runner.pending if not runner.blocked(getattr(m, "sender", ""))]
-        return {"log": log, "reply": f"好，之后不再接收「{name}」的消息"
-                + ("" if seen else "（还没见过这个名字，按原样拉黑；名字要和群里显示的一致）")}
+        # Where to tell them: the chat named, or their own private chat when blocked everywhere.
+        where = chat or (name if name in self.settings["chats"] else None)
+        if notify and where:
+            group = self.settings.chat_mode(where) == "group"
+            self.relays.append((where, f"你已被拉黑，这段时间我不会再接收你的消息。{self.block_span(until)}",
+                                (name,) if group else ()))
+        return f"好，{self.block_label({'name': name, 'chat': chat, 'until': until})}，不再接收他的消息" + \
+            ("，已经通知他了" if notify and where else "")
+
+    def unblock(self, name, chat=None):
+        """Lift `name`'s block in `chat`, or every block on that name when `chat` is None."""
+        entries = self.block_entries()
+        kept = [e for e in entries if not (e["name"] == name and (chat is None or e["chat"] in (None, chat)))]
+        self.settings.update(blocked=kept)
+        return len(kept) != len(entries)
 
     def hand_off(self, kind, task):
         """The chat model heard the owner ask for real work. Drawing goes to the draw agent, anything
@@ -757,15 +823,62 @@ class Bot:
         return None
 
     def chat_members(self, chat):
-        """Names already seen in a group (sender book, roster), for checking @ targets."""
+        """People seen in a group (roster, sender book), one name each, for pickers and @ checks.
+
+        The sender book keeps every OCR reading of a person ("测试群友", "PinkFIyPig", "PinkHyPig");
+        only the label or the most frequent reading counts, and a person read just once is left out."""
         from personas import safe_name
         names = list((self.settings["chats"].get(chat) or {}).get("roster") or [])
         try:
             book = json.loads((self.data / "senders" / f"{safe_name(chat)}.json").read_text(encoding="utf-8"))
-            names += [n for entry in book for n in (entry.get("names") or {})]
         except Exception:
-            pass
+            book = []
+        for person in book:
+            readings = person.get("names") or {}
+            if person.get("label"):
+                names.append(person["label"])
+            elif readings and sum(readings.values()) >= 2:
+                names.append(max(readings.items(), key=lambda kv: kv[1])[0])
         return list(dict.fromkeys(n for n in names if n))
+
+    def group_people(self, chat):
+        """Everyone the sender book knows in `chat`, as shown in chat: {index, name, readings, last}.
+
+        `name` is what she calls them (label, most frequent reading, else 群友N); `last` is the last
+        thing that name said in her history, to tell who 群友11 is."""
+        from personas import safe_name
+        from senders import SenderBook
+        try:
+            book = json.loads((self.data / "senders" / f"{safe_name(chat)}.json").read_text(encoding="utf-8"))
+        except Exception:
+            book = []
+        runner = self.runners.get(chat)
+        history = runner.history if runner else []
+        people = []
+        for i, person in enumerate(book):
+            readings = person.get("names") or {}
+            name = SenderBook.best_name({"label": person.get("label"), "names": Counter(readings)}) or f"群友{i + 1}"
+            last = next((r["text"] for r in reversed(history) if r.get("sender") == name), "")
+            people.append({"index": i, "name": name, "readings": readings, "label": person.get("label"),
+                           "last": last})
+        return people
+
+    def name_person(self, chat, index, label):
+        """Give person `index` of `chat`'s sender book a fixed name (empty: back to OCR readings).
+        Runs on the worker: the adapter may hold the same book in memory and save it."""
+        from personas import safe_name
+        from senders import SenderBook
+        path = self.data / "senders" / f"{safe_name(chat)}.json"
+        live = getattr(self.adapter, "book", None)
+        book = live if live is not None and Path(live.path) == path else \
+            SenderBook(path, (self.settings["chats"].get(chat) or {}).get("roster"))
+        if not 0 <= index < len(book.people):
+            raise ValueError("这个群友已经不在名单里了")
+        book.people[index]["label"] = label.strip() or None
+        book.save()
+        if book is live:
+            self.adapter.sender_cache.clear()  # names cached per bubble would keep the old one
+        return book.people[index]["label"]
 
     def chat_jargon(self, chat):
         """The group's nicknames and slang from memory ("小王 / 老赵：…对应 小李"), as lines."""
@@ -941,6 +1054,22 @@ class Bot:
             # On its own thread: a big folder takes many minutes and chats must not wait.
             self.scanning = threading.Thread(target=self.scan_stickers, daemon=True)
             self.scanning.start()
+        elif name == "name_person":
+            _, chat, index, label = args
+            try:
+                named = self.name_person(chat, index, label)
+                self.emit("status", f"已把群友{index + 1}叫作「{named}」" if named else f"群友{index + 1}改回按识别结果叫")
+            except Exception as exc:
+                self.emit("error", f"没改成名字：{exc}")
+            self.emit("people", None)
+        elif name == "block":
+            _, who, chat, minutes, notify = args
+            self.emit("status", self.block(who, chat, minutes, notify))
+            self.emit("blocked", None)
+        elif name == "unblock":
+            _, who, chat = args
+            self.emit("status", f"已解除拉黑：{who}" if self.unblock(who, chat) else f"「{who}」不在黑名单里")
+            self.emit("blocked", None)
         elif name == "resume":
             if not self.enabled.is_set():
                 self.emit("status", "先点“开始 / 继续”，再让她重新接话")
@@ -1066,6 +1195,8 @@ class App:
         self.build_model(self.tab(notebook, "模型"))
         self.build_stickers(self.tab(notebook, "表情包"))
         self.build_gallery(self.tab(notebook, "画图"))
+        self.build_blocklist(self.tab(notebook, "黑名单"))
+        self.build_people(self.tab(notebook, "群成员"))
         self.build_memory(self.tab(notebook, "记忆"))
         self.build_rhythm(self.tab(notebook, "节奏"))
         self.refresh_header()
@@ -1234,6 +1365,10 @@ class App:
                 self.chat_list.insert("end", f"{name}    （{'群聊' if info['mode'] == 'group' else '私聊'}）")
         if hasattr(self, "draw_chat"):
             self.fill_draw_chats()
+        if hasattr(self, "block_chat"):
+            self.fill_block_chats()
+        if hasattr(self, "people_chat"):
+            self.fill_people_chats()
 
     def add_chat(self):
         name = self.new_chat.get().strip()
@@ -1578,6 +1713,169 @@ class App:
             self.sticker_list.insert("end", f"{sid}：{desc}")
         if not catalog:
             self.sticker_list.insert("end", "（还没有整理过的表情包）")
+
+    # ---- 群成员 ----
+    def build_people(self, frame):
+        ttk.Label(frame, wraplength=700, text=(
+            "群里的人是按头像认的，名字来自截图识别；识别不出来的会叫“群友N”，识别错的会有好几种写法。"
+            "在这里给他定一个名字，以后他的消息、拉黑和画图名单都用这个名字。看“最近说的话”认出是谁。")).pack(anchor="w")
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=8)
+        ttk.Label(row, text="群：").pack(side="left")
+        self.people_chat = ttk.Combobox(row, state="readonly", width=20)
+        self.people_chat.pack(side="left")
+        self.people_chat.bind("<<ComboboxSelected>>", lambda e: self.show_people())
+        ttk.Button(row, text="刷新", command=self.show_people).pack(side="left", padx=6)
+        self.people_list = tk.Listbox(frame, exportselection=False, height=14)
+        self.people_list.pack(fill="both", expand=True)
+        self.people_list.bind("<<ListboxSelect>>", lambda e: self.pick_person())
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=6)
+        ttk.Label(row, text="叫他：").pack(side="left")
+        self.person_name = ttk.Entry(row, width=20)
+        self.person_name.pack(side="left")
+        self.person_name.bind("<Return>", lambda e: self.save_person())
+        ttk.Button(row, text="保存名字", command=self.save_person).pack(side="left", padx=6)
+        ttk.Label(row, text="（留空保存 = 改回按识别结果叫）").pack(side="left")
+        self.people_items = []
+        self.fill_people_chats()
+
+    def fill_people_chats(self):
+        groups = [c for c, info in self.settings["chats"].items() if info["mode"] == "group"]
+        self.people_chat["values"] = groups
+        if groups and self.people_chat.get() not in groups:
+            self.people_chat.set(groups[0])
+        elif not groups:
+            self.people_chat.set("")
+        self.show_people()
+
+    def show_people(self):
+        chat = self.people_chat.get()
+        self.people_items = self.bot.group_people(chat) if chat else []
+        self.people_list.delete(0, "end")
+        for person in self.people_items:
+            seen = "、".join(f"{n}×{c}" for n, c in sorted(person["readings"].items(), key=lambda kv: -kv[1])[:3])
+            fixed = "（已定名）" if person["label"] else ""
+            last = f"  最近说：{person['last'][:24]}" if person["last"] else ""
+            self.people_list.insert("end", f"{person['name']}{fixed}  识别到：{seen or '没有'}{last}")
+        if not self.people_items:
+            self.people_list.insert("end", "（还没认识这个群里的人）")
+
+    def pick_person(self):
+        picked = [self.people_items[i] for i in self.people_list.curselection() if i < len(self.people_items)]
+        if picked:
+            self.person_name.delete(0, "end")
+            self.person_name.insert(0, picked[0]["label"] or "")
+
+    def save_person(self):
+        picked = [self.people_items[i] for i in self.people_list.curselection() if i < len(self.people_items)]
+        if not picked:
+            self.status.set("先在列表里选中一个人")
+            return
+        self.bot.command("name_person", self.people_chat.get(), picked[0]["index"], self.person_name.get().strip())
+
+    # ---- 黑名单 ----
+    BLOCK_SPANS = {"当太阳从西边升起（永久）": None, "10 分钟": 10, "1 小时": 60, "6 小时": 360,
+                   "1 天": 1440, "7 天": 10080}
+
+    def build_blocklist(self, frame):
+        ttk.Label(frame, wraplength=700, text=(
+            "被拉黑的人发的消息她一概不接收。选群再选成员，就只在那个群里不理他；选私聊就是那个人的私聊。"
+            "拉黑时会给对方发一次通知，说明黑多久（群里会@他）。到时间自动解封。")).pack(anchor="w")
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=8)
+        ttk.Label(row, text="聊天：").pack(side="left")
+        self.block_chat = ttk.Combobox(row, state="readonly", width=18)
+        self.block_chat.pack(side="left")
+        self.block_chat.bind("<<ComboboxSelected>>", lambda e: self.fill_block_members())
+        ttk.Label(row, text="  成员：").pack(side="left")
+        self.block_member = ttk.Combobox(row, width=16)
+        self.block_member.pack(side="left")
+        row = ttk.Frame(frame)
+        row.pack(fill="x")
+        ttk.Label(row, text="时长：").pack(side="left")
+        self.block_span = ttk.Combobox(row, values=list(self.BLOCK_SPANS), width=22)
+        self.block_span.set("当太阳从西边升起（永久）")
+        self.block_span.pack(side="left")
+        self.block_notify = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="拉黑时通知对方", variable=self.block_notify).pack(side="left", padx=10)
+        ttk.Button(row, text="拉黑", command=self.add_block).pack(side="left")
+        ttk.Label(frame, text="当前黑名单：").pack(anchor="w", pady=(12, 0))
+        self.block_list = tk.Listbox(frame, selectmode="extended", exportselection=False, height=10)
+        self.block_list.pack(fill="both", expand=True)
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", pady=6)
+        ttk.Button(bar, text="解除选中", command=self.remove_blocks).pack(side="right")
+        ttk.Button(bar, text="刷新", command=self.show_blocks).pack(side="right", padx=6)
+        self.block_items = []
+        self.fill_block_chats()
+        self.show_blocks()
+
+    def fill_block_chats(self):
+        owner = self.settings["owner"]
+        chats = [c for c in self.settings["chats"] if c != owner]
+        self.block_chat["values"] = chats
+        if chats and self.block_chat.get() not in chats:
+            self.block_chat.set(chats[0])
+        elif not chats:
+            self.block_chat.set("")
+        self.fill_block_members()
+
+    def fill_block_members(self):
+        chat = self.block_chat.get()
+        if chat and self.settings.chat_mode(chat) == "group":
+            owner = self.settings["owner"]
+            members = [m for m in self.bot.chat_members(chat) if m != owner]
+            self.block_member.configure(state="normal", values=members)
+            if self.block_member.get() not in members:
+                self.block_member.set(members[0] if members else "")
+        else:  # a private chat: the person is the chat
+            self.block_member.configure(values=[chat] if chat else [])
+            self.block_member.set(chat)
+            self.block_member.configure(state="disabled")
+
+    def block_minutes(self):
+        """Minutes from the duration box (None: for good); raises ValueError on something unreadable."""
+        text = self.block_span.get().strip()
+        if text in self.BLOCK_SPANS:
+            return self.BLOCK_SPANS[text]
+        _, minutes = split_duration("x " + text.replace(" ", ""))
+        if not minutes:
+            raise ValueError(text)
+        return minutes
+
+    def add_block(self):
+        chat = self.block_chat.get()
+        name = self.block_member.get().strip().lstrip("@")
+        if not chat or not name:
+            self.status.set("先选聊天，群聊还要选或填一个成员")
+            return
+        if name == self.settings["owner"]:
+            self.status.set("主人不能拉黑")
+            return
+        try:
+            minutes = self.block_minutes()
+        except ValueError:
+            messagebox.showerror("拉黑", "时长写成“30分钟”“2小时”“3天”，或者选“当太阳从西边升起”")
+            return
+        self.bot.command("block", name, chat, minutes, self.block_notify.get())
+        self.status.set(f"正在拉黑 {name}…")
+
+    def show_blocks(self):
+        self.block_items = self.bot.block_entries()
+        self.block_list.delete(0, "end")
+        for entry in self.block_items:
+            self.block_list.insert("end", self.bot.block_label(entry))
+        if not self.block_items:
+            self.block_list.insert("end", "（黑名单是空的）")
+
+    def remove_blocks(self):
+        picked = [self.block_items[i] for i in self.block_list.curselection() if i < len(self.block_items)]
+        if not picked:
+            self.status.set("先在黑名单里选中要解除的人")
+            return
+        for entry in picked:
+            self.bot.command("unblock", entry["name"], entry["chat"])
 
     # ---- 画图 ----
     def build_gallery(self, frame):
@@ -1958,6 +2256,14 @@ class App:
                     continue
                 if kind == "memory":
                     self.show_memory()
+                    continue
+                if kind == "blocked":
+                    self.show_blocks()
+                    continue
+                if kind == "people":
+                    self.show_people()
+                    if hasattr(self, "block_chat"):
+                        self.fill_block_members()
                     continue
                 if kind == "memory_edit_result":
                     editor = getattr(self, "memory_editor", None)

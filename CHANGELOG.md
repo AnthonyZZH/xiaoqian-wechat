@@ -2,6 +2,15 @@
 
 Each update to this repository is tagged as a small version (`v0.1`, `v0.2`, …).
 
+## v0.9
+
+- Console 黑名单 tab: block a group member or a private contact, in one chat or everywhere, for a set time or for good (default "当太阳从西边升起"). The blocked person gets one notice, with a real @ in groups. The owner can also say "拉黑 X 2小时". Entries are `{name, chat, until}`; older plain-name entries still count.
+- Console 群成员 tab: give a member a fixed name when OCR cannot read it. Member lists show one name per person (the label, or the most frequent reading).
+- Group nicknames are read with RapidOCR (offline PaddleOCR models through onnxruntime), which reads Chinese names that Windows OCR returns nothing for. Readings below 0.8 confidence are ignored, and Windows OCR is the fallback when RapidOCR is not installed. onnxruntime is imported before winrt, because winrt's older msvcp140.dll crashes it. A row cut off at the top of the list gets no name guess.
+- "生成/来/做/整/弄…一张图" counts as a drawing request as well as "画…".
+- Private chats: when her place has scrolled away, for example because pictures were sent from this account, the messages after her last bubble on screen are taken as new. 重新接话 first takes in the other side's latest on-screen lines that never reached her, so their drawing requests and commands still run, and then always answers.
+- Her own openings and follow-ups start a new topic and do not carry on the last thread.
+
 ## v0.8
 
 - Voice messages: a new voice row is transcribed with WeChat's own right-click voice-to-text before the model sees it; labels like '语音3"秒未播放' are no longer mistaken for a transcript, and voice rows keep a stable text so a chat is found again after switching.

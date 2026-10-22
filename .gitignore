@@ -43,3 +43,4 @@ dist/
 *.egg-info/
 Thumbs.db
 Desktop.ini
+/vendor_ocr/

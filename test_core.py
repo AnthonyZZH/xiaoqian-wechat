@@ -644,6 +644,39 @@ class DrawRightsTests(Temp):
             close_window(app)
 
 
+class BlocklistTabTests(Temp):
+    def test_console_picks_a_member_or_a_private_chat_and_a_duration(self):
+        from app import App, Bot
+        settings = Settings(self.dir / 's.json')
+        settings.update(owner='主人', chats={'主人': {'mode': 'private'}, '示例群甲': {'mode': 'group', 'roster': ['阿杰', '主人']},
+                                           '小王': {'mode': 'private'}})
+        bot = Bot(settings, PersonaStore(self.dir / 'p'), False, log_dir=self.dir / 'logs', data_dir=self.dir / 'data')
+        app = App(bot)
+        app.window.withdraw()
+        try:
+            self.assertEqual(list(app.block_chat['values']), ['示例群甲', '小王'])
+            app.block_chat.set('示例群甲')
+            app.fill_block_members()
+            self.assertEqual(list(app.block_member['values']), ['阿杰'])  # never the owner
+            app.block_span.set('30分钟')
+            app.add_block()
+            self.assertEqual(bot.commands.get_nowait(), ('block', '阿杰', '示例群甲', 30, True))
+            app.block_chat.set('小王')
+            app.fill_block_members()
+            self.assertEqual((app.block_member.get(), str(app.block_member['state'])), ('小王', 'disabled'))
+            app.block_span.set('当太阳从西边升起（永久）')
+            app.block_notify.set(False)
+            app.add_block()
+            self.assertEqual(bot.commands.get_nowait(), ('block', '小王', '小王', None, False))
+            bot.block('阿杰', '示例群甲', 60, notify=False)
+            app.show_blocks()
+            self.assertIn('阿杰（在「示例群甲」，时长 1 小时', app.block_list.get(0))
+            self.assertEqual(list(app.people_chat['values']), ['示例群甲'])  # groups only
+            self.assertIn('还没认识这个群里的人', app.people_list.get(0))
+        finally:
+            close_window(app)
+
+
 class LMStudioTests(unittest.TestCase):
     def setUp(self):
         patcher = mock.patch.object(lmstudio, 'release_memory', return_value=0)
@@ -838,6 +871,29 @@ class OcrTests(unittest.TestCase):
         ImageDraw.Draw(img).text((6, 6), '小王同学', font=ImageFont.truetype(str(font_path), 20),
                                  fill=(60, 60, 60))
         self.assertEqual(read_text(img, 2), '小王同学')
+
+    def test_reads_a_chinese_nickname_windows_ocr_misses(self):
+        from ocr import rapid, read_name
+        if rapid() is None:  # pragma: no cover
+            self.skipTest('vendor_ocr (RapidOCR) not installed')
+        img = Image.new('RGB', (540, 33), (30, 30, 30))  # WeChat dark mode, grey nickname
+        ImageDraw.Draw(img).text((2, 5), '嘎嘎嘎', font=ImageFont.truetype('C:/Windows/Fonts/msyh.ttc', 18),
+                                 fill=(128, 128, 128))
+        self.assertEqual(read_name(img), '嘎嘎嘎')
+        self.assertEqual(read_name(Image.new('RGB', (540, 33), (30, 30, 30))), '')
+
+    def test_a_row_cut_off_at_the_top_has_no_name_strip(self):
+        import wechat_adapter as wa
+        adapter = wa.WeChatAdapter.__new__(wa.WeChatAdapter)
+        from types import SimpleNamespace
+        adapter.layout = dict(wa.GROUP_LAYOUT)
+        frame = Image.new('RGB', (800, 600))
+        rect = SimpleNamespace(top=100)
+        row = lambda top: SimpleNamespace(BoundingRectangle=SimpleNamespace(top=top))
+        avatar, strip = adapter.crops(row(150), rect, lambda: frame, 1.5)
+        self.assertIsNotNone(avatar)
+        self.assertIsNotNone(strip)
+        self.assertEqual(adapter.crops(row(90), rect, lambda: frame, 1.5)[1], None)  # half a name: no guess
 
 
 if __name__ == '__main__':

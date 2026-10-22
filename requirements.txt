@@ -8,3 +8,4 @@ winrt-Windows.Globalization==3.2.1
 winrt-Windows.Graphics.Imaging==3.2.1
 winrt-Windows.Media.Ocr==3.2.1
 winrt-Windows.Storage.Streams==3.2.1
+rapidocr-onnxruntime==1.4.4

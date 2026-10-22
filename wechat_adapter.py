@@ -475,7 +475,8 @@ class WeChatAdapter:
             time.sleep(0.4)
 
     def crops(self, item, rect, grab, dpi):
-        """(avatar image, nickname strip image) for a group row, from the list screenshot."""
+        """(avatar image, nickname strip image) for a group row, from the list screenshot.
+        None for a part scrolled out above the list: half a name reads as garbage like "TTT"."""
         frame, box, lay = grab(), item.BoundingRectangle, self.layout
         top = box.top - rect.top
 
@@ -483,27 +484,30 @@ class WeChatAdapter:
             return round(v * dpi)
 
         x0, y0 = s(lay["avatar_left"]), top + s(lay["avatar_top"])
-        avatar = frame.crop((x0, y0, x0 + s(lay["avatar_size"]), y0 + s(lay["avatar_size"])))
+        avatar = frame.crop((x0, y0, x0 + s(lay["avatar_size"]), y0 + s(lay["avatar_size"]))) if y0 >= 0 else None
         nx, ny = s(lay["name_left"]), top + s(lay["name_top"])
-        name = frame.crop((nx, ny, min(frame.width, nx + s(lay["name_width"])), ny + s(lay["name_height"])))
+        name = (frame.crop((nx, ny, min(frame.width, nx + s(lay["name_width"])), ny + s(lay["name_height"])))
+                if ny >= 0 else None)
         return avatar, name
 
     def sender_of(self, key, item, rect, grab, dpi, uia_name):
         if key in self.sender_cache:
             return self.sender_cache[key]
-        fingerprint, ocr_name = None, uia_name
+        fingerprint, ocr_name, cut = None, uia_name, False
         try:
             avatar, strip = self.crops(item, rect, grab, dpi)
-            fingerprint = avatar_hash(avatar)
-            if not ocr_name:
-                from ocr import prepare, read_text
-                ocr_name = read_text(prepare(strip), 2) or None
+            cut = strip is None
+            fingerprint = avatar_hash(avatar) if avatar is not None else None
+            if not ocr_name and strip is not None:
+                from ocr import read_name
+                ocr_name = read_name(strip) or None
         except Exception:
             pass  # An unknown sender only degrades context; it never decides whether to send.
         name = self.book.resolve(fingerprint, ocr_name) if self.book else (ocr_name or "群友")
         if len(self.sender_cache) > 800:
             self.sender_cache.clear()
-        self.sender_cache[key] = name
+        if not cut:  # read it again once it is scrolled fully into view
+            self.sender_cache[key] = name
         return name
 
     @staticmethod

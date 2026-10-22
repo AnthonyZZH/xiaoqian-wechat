@@ -29,7 +29,7 @@ Supports private chats, group chats, editable long-term memory, and stickers. Th
 - Windows 10 or 11, with **64-bit Python 3.11** and Tkinter.
 - A logged-in desktop WeChat client. The adapter targets **WeChat 4.1.x** and has been tried with **4.1.15.13**. Other versions may require calibration.
 - LM Studio, its `lms` CLI, and a downloaded model. Image understanding and sticker labeling require a vision-capable model.
-- The Windows Chinese OCR component for group nickname recognition.
+- RapidOCR (installed from `requirements.txt`) for group nicknames; the Windows Chinese OCR component is the fallback.
 - Enough GPU memory for your chosen model. The loader requests full GPU offload; this does not guarantee that every configuration avoids system memory pressure.
 
 The current interface and built-in prompts are in Chinese. This English README documents installation and operation; it does not add an English interface.
@@ -124,6 +124,7 @@ Let conversation participants know they are interacting with an AI. Before publi
 
 Every update is tagged as a small version (`v0.x`); the full notes are in [CHANGELOG.md](CHANGELOG.md).
 
+- **v0.9** — Console tabs for a timed blocklist (with a notice to the blocked person) and for naming group members; Chinese nicknames read with RapidOCR; "生成一张…" draws; private chats recover a lost place, and 重新接话 picks up requests that never reached her; her own openings start new topics.
 - **v0.8** — Voice messages through WeChat's own voice-to-text; private chats always answered and a 重新接话 button; a persona that refuses lewd requests and hits back at insults; a new contact's first visit finds its place; image descriptions no longer invent captions or names; no more Tk crashes in the test run.
 - **v0.7** — Drawing rights and limits per allowed chat, live drawing-job states, a chat selector that stays synchronized, and periodic memory updates for every allowed chat with progress restored after restart.
 - **v0.6** — Real work mentioned in the owner's chat is handed to an agent (drawings to the draw agent, the rest to Codex) instead of being promised; drawings can look up references online first; a 画图 console tab shows where pictures are, previews, opens and deletes them.

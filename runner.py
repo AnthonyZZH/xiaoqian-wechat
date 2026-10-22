@@ -106,6 +106,7 @@ class Runner:
         # scheduler for one step: {"idle_minutes", "unanswered"}. The hooks report back to it.
         self.opening = None
         self.resume_once = False  # the owner pressed 重新接话 for this chat
+        self.insist = False  # 重新接话 took in missed lines: answer them whatever the model thinks
         self.opening_active = False
         self.on_heard = lambda: None
         self.on_spoke = lambda opening: None
@@ -321,6 +322,23 @@ class Runner:
         self.emit("received", f"{sender}：{row.text}" if entry.get("sender") else row.text)
         return True
 
+    def catch_up(self, rows):
+        """重新接话: the other side's latest lines on screen that never reached her (her place was
+        lost, or they came during a pause) are taken in now, drawing and commands included."""
+        known = {compact(r["text"]) for r in self.history[-20:] if r["role"] == "user"}
+        block = []
+        for row in reversed(rows):
+            if row.role == "user":
+                block.append(row)
+            elif block:
+                break
+        changed = False
+        for row in reversed(block[:5]):
+            # Pictures and voice read back only as a bare label; never take those in twice.
+            if not row.text.startswith("[") and compact(row.text) not in known:
+                changed = self.accept(row) or changed
+        return changed
+
     def ingest(self, rows, replay=False):
         """replay: rows from a pause, kept as context; agent commands in them are not run."""
         changed = False
@@ -419,9 +437,21 @@ class Runner:
         self.save()
 
     def blocked(self, sender):
-        """Blocked by the owner: the sender in a group, or the other side of a private chat."""
-        names = set(self.config.get("blocked") or []) - {self.config.get("owner", "")}
-        return (sender in names) if self.mode == "group" else (self.chat in names)
+        """Blocked by the owner: the sender in a group, or the other side of a private chat.
+
+        Entries are {"name", "chat": where (None: everywhere), "until": wall-clock end (None: for
+        good)}; a plain name from older settings blocks everywhere for good."""
+        who = sender if self.mode == "group" else self.chat
+        if not who or who == self.config.get("owner", ""):
+            return False
+        now = time.time()
+        for entry in self.config.get("blocked") or []:
+            if isinstance(entry, str):
+                entry = {"name": entry}
+            if entry.get("name") == who and entry.get("chat") in (None, "", self.chat) \
+                    and (entry.get("until") is None or entry["until"] > now):
+                return True
+        return False
 
     def is_owner(self):
         return self.mode == "private" and self.chat == self.config.get("owner", "")
@@ -461,6 +491,11 @@ class Runner:
                 start = matches[-1] + 1
             elif notices:
                 start = notices[-1]
+            elif self.mode == "private" and any(row.role == "assistant" for row in rows):
+                # Her place scrolled away (pictures sent from this account meanwhile push it up), but a
+                # bubble from this side is on screen: what came after it is unanswered, and a private
+                # chat is always answered.
+                start = max(i for i, row in enumerate(rows) if row.role == "assistant") + 1
             else:
                 raise RuntimeError("找不到上次消息的位置，保留待办；请打开聊天加载完整记录后再继续")
         elif self.reply_latest and rows and rows[-1].role == "user":
@@ -653,6 +688,10 @@ class Runner:
             self.resume(rows)
             return
         self.ingest(rows)
+        if self.resume_once and self.catch_up(rows):
+            self.resume_once = False  # answered as new messages, not as a resume
+            self.insist = True  # but still always answered
+            self.save()
         if self.notices:
             self.deliver()
             return
@@ -672,9 +711,10 @@ class Runner:
                       for r in self.history if r["role"] == "user"][-5:]
             opening = {"resume": recent}
         self.resume_once = False
+        insist, self.insist = self.insist and has_pending, False
         resuming = bool(opening and "resume" in opening)
         # The owner's rule: a private chat is always answered, and 重新接话 always says something.
-        must_reply = resuming or (self.mode == "private" and bool(self.pending))
+        must_reply = resuming or insist or (self.mode == "private" and bool(self.pending))
         if proactive and not opening and not self.may_proactive(now):
             if not self.learn(now):
                 self.status(f"监听中 · {self.chat}")

@@ -17,7 +17,7 @@ from settings import DATA
 
 
 def inspect(adapter, out_dir: Path) -> str:
-    from ocr import prepare, read_lines, read_text
+    from ocr import prepare, read_lines, read_name
     from wechat_adapter import GROUP_LAYOUT, _user32, descendants
 
     title, single = adapter.current()
@@ -53,9 +53,10 @@ def inspect(adapter, out_dir: Path) -> str:
                      "ocr_left_lines": read_lines(left.convert("RGB"), 2)}
             if role == "user":
                 avatar, strip = adapter.crops(item, rect, lambda: frame, dpi)
-                avatar.save(out / f"row{n}_avatar.png")
-                strip.save(out / f"row{n}_name.png")
-                entry["ocr_name_strip"] = read_text(prepare(strip), 2)
+                for part, image in (("avatar", avatar), ("name", strip)):
+                    if image is not None:
+                        image.save(out / f"row{n}_{part}.png")
+                entry["ocr_name_strip"] = read_name(strip) if strip is not None else "（被列表顶部挡住）"
                 names.append(entry["ocr_name_strip"] or "?")
             report.append(entry)
     finally:
