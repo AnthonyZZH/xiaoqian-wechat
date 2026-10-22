@@ -29,6 +29,10 @@ AGENT_NAMES = {"claude": "Claude", "codex": "Codex", "deepseek": "DeepSeek"}
 AGENT_ALIASES = {key[1:].casefold(): agent for key, agent in DEFAULT_ROUTES.items()}  # "停掉codex"
 JOB_STATES = {"running": "进行中", "done": "做完了", "failed": "失败了", "timeout": "超时被停掉了",
               "stopped": "已经停掉了"}
+# "给示例联系人私聊发：晚安" from the owner: the exact text, to exactly that chat, no model involved.
+OWNER_SEND = re.compile(r"(?:你)?(?:去|帮我|再)?(?:给|跟|向|对)\s*(?P<chat>[^\s:：,，]{1,40}?)\s*(?:私聊)?\s*"
+                        r"(?:发消息|发个消息|发一句|发|说)\s*(?:说)?\s*[:：]\s*(?P<text>\S.*)")
+NOT_A_CHAT = {"我", "你", "他", "她", "它", "大家", "我们", "你们", "他们"}
 
 
 class Enabled:
@@ -238,12 +242,22 @@ class Bot:
                 self.reports.pop(0)
                 self.report_retry_at = 0.0
             return
-        if self.relays and (chat is None or priority(chat) > 0):
-            target, text = self.relays.pop(0)
+        # The open chat's own waiting entry must not hold back what it asked for (single-chat mode).
+        if self.relays and (chat is None or chat == current or priority(chat) > 0):
+            # Owner sends carry a third item: the exact text, any chat, and a truthful report back.
+            target, text, *exact = self.relays.pop(0)
+            from runner import NOTICE_CHARS
+            from wechat_adapter import SendUncertain
             try:
-                self.send_relay(target, text)
+                self.send_relay(target, text, *(("主人让我发的", NOTICE_CHARS) if exact else ()))
             except Exception as exc:
                 self.emit("error", f"向「{target}」转告失败：{exc}；没有改发到其他聊天")
+                if exact:
+                    self.reports.append(f"发给「{target}」的结果不确定，没有重发，请看一下微信" if isinstance(exc, SendUncertain)
+                                        else f"没发给「{target}」：{exc}")
+            else:
+                if exact:
+                    self.reports.append(f"已发给「{target}」：{text[:60] + '…' if len(text) > 60 else text}")
             return
         if not self.settings["multi_chat"] or chat is None:
             if current in excluded and not runner.initialized:
@@ -270,15 +284,21 @@ class Bot:
         self.runner.step()
         self.watch()
 
-    # ---- local agents, commanded from the owner's private chat ----
+    # ---- owner commands in the owner's private chat: sends and local agents ----
     def agent_command(self, text, act=True):
         """None for ordinary chat; else {"log": passphrase-free text, "reply": receipt}.
 
-        With act=False (messages from a pause) nothing is started or stopped.
+        With act=False (messages from a pause) nothing is sent, started or stopped.
         """
+        line = " ".join(str(text).split())
+        send = OWNER_SEND.fullmatch(line)
+        if send and send["chat"] not in NOT_A_CHAT and send["chat"].casefold() not in AGENT_ALIASES:
+            if act:
+                # Confirmed (or not) by a report once it has really been tried; never claimed early.
+                self.relays.append((send["chat"], send["text"], True))
+            return {"log": line, "reply": None}
         if not self.settings["agents_enabled"]:
             return None
-        line = " ".join(str(text).split())
         if line.rstrip("?？。!！") in ("任务", "任务列表"):
             return {"log": line, "reply": self.job_list() if act else None}
         match = re.fullmatch(r"(?:停掉|停止|停下)\s*[:：,，]?\s*([^\s的]+)(?:\s*的?任务)?", line)

@@ -24,6 +24,14 @@ from agents import AgentJobs, DEFAULT_ROUTES, find_codex, parse_command
 UTF8_ENV = {"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
 
 
+class DefaultConfigTests(unittest.TestCase):
+    def test_claude_task_follows_an_end_of_options_marker(self):
+        # --tools takes several values; without "--" the real CLI swallows the task as a tool name.
+        from agents import default_configs
+        cmd = default_configs()["claude"]["cmd"]
+        self.assertEqual(cmd[-2:], ["--", "{task}"])
+
+
 class ParseCommandTests(unittest.TestCase):
     def test_default_routes_and_separators(self):
         cases = [

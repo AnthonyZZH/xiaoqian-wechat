@@ -508,3 +508,80 @@ class AgentBridgeTests(Temp):
         configs = bot.agent_configs()
         self.assertEqual(configs["codex"]["model"], "gpt-test")
         self.assertEqual(configs["codex"]["reasoning"], "high")
+
+    # ---- owner sends: "给X发：…" to any chat ----
+    def with_contact(self, wx, name='示例联系人'):
+        """A WeChat chat the bot is not watching (not in settings["chats"])."""
+        wx.chats[name], wx.modes[name] = [], 'private'
+
+    def test_owner_send_reaches_an_unwatched_chat_verbatim(self):
+        for multi in (True, False):
+            with self.subTest(multi=multi):
+                bot, wx = self.make(multi=multi)
+                self.with_contact(wx)
+                self.tick(bot)
+                self.owner_says(bot, wx, '去给示例联系人私聊发：早点休息🌙，晚安啦', ticks=3)
+                self.assertIn(('示例联系人', '早点休息🌙，晚安啦'), wx.sent)
+                self.assertEqual(wx.sent[-1], ('示例好友', '已发给「示例联系人」：早点休息🌙，晚安啦'))
+                self.assertEqual(wx.open, '示例好友')
+                self.assertEqual(self.prompts, [])  # never the model, so never a false "sent"
+                self.assertNotIn('示例联系人', bot.settings['chats'])
+
+    def test_owner_send_phrasings(self):
+        bot, _ = self.make()
+        for text, chat, body in [('给示例联系人发：明天见', '示例联系人', '明天见'),
+                                 ('你给示例联系人私聊发：快睡', '示例联系人', '快睡'),
+                                 ('跟示例群甲说: 今晚八点', '示例群甲', '今晚八点'),
+                                 ('帮我给 文件传输助手 发消息：测试', '文件传输助手', '测试')]:
+            bot.relays.clear()
+            self.assertEqual(bot.agent_command(text), {'log': text, 'reply': None}, text)
+            self.assertEqual(bot.relays, [(chat, body, True)], text)
+        for text in ('给我发：好的', '你没发啊', '去群里说句话', '给claude发：写周报', '给示例联系人发'):
+            bot.relays.clear()
+            bot.agent_command(text)
+            self.assertFalse([r for r in bot.relays if len(r) == 3], text)
+
+    def test_owner_send_failure_is_reported_truthfully(self):
+        bot, wx = self.make()
+        self.tick(bot)
+        opened = wx.open_chat
+
+        def no_such_chat(name):
+            if name == '查无此人':
+                raise RuntimeError('搜索结果不唯一或不存在')
+            opened(name)
+
+        wx.open_chat = no_such_chat
+        self.owner_says(bot, wx, '给查无此人发：你好', ticks=3)
+        self.assertEqual(wx.sent, [('示例好友', '没发给「查无此人」：搜索结果不唯一或不存在')])
+        self.assertEqual(wx.open, '示例好友')
+
+    def test_uncertain_owner_send_is_not_claimed_or_retried(self):
+        from wechat_adapter import SendUncertain
+        bot, wx = self.make()
+        self.with_contact(wx)
+        self.tick(bot)
+        original = wx.send
+
+        def uncertain(text, cancel, max_chars=None):
+            if wx.open == '示例联系人':
+                raise SendUncertain('发送结果不确定')
+            return original(text, cancel, max_chars)
+
+        wx.send = uncertain
+        self.owner_says(bot, wx, '给示例联系人发：晚安')
+        self.assertFalse(bot.enabled.is_set())  # an uncertain send pauses, as before
+        bot.enabled.set()
+        self.tick(bot, 3)
+        self.assertEqual([s for s in wx.sent if s[0] == '示例联系人'], [])
+        self.assertEqual(wx.sent[-1], ('示例好友', '发给「示例联系人」的结果不确定，没有重发，请看一下微信'))
+
+    def test_owner_send_from_a_pause_or_a_group_does_nothing(self):
+        bot, wx = self.make()
+        self.with_contact(wx)
+        self.tick(bot)
+        self.assertIsNone(bot.agent_command('给示例联系人发：晚安', act=False)['reply'])
+        self.assertEqual(bot.relays, [])
+        wx.post('示例群甲', '给示例联系人发：晚安', sender='示例群友')
+        self.tick(bot, 3)
+        self.assertNotIn('示例联系人', [chat for chat, _ in wx.sent])

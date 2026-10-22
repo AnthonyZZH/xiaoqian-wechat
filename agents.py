@@ -314,6 +314,7 @@ def default_configs() -> dict:
             # --restricted: 文件工具限制在 cwd（以及 --add-dir）内；
             # --tools 只给只读/写文件工具，不给 Bash/PowerShell，所以不会执行删除命令。
             # --permission-mode acceptEdits: 非交互下自动接受文件编辑，避免卡在权限询问。
+            # --tools 可以接多个值，不加 "--" 会把任务文本也当成工具名吞掉（实测报“没有输入”）。
             "cmd": [
                 "{claude}",
                 "-p",
@@ -322,6 +323,7 @@ def default_configs() -> dict:
                 "acceptEdits",
                 "--tools",
                 "Read,Edit,Write,Glob,Grep",
+                "--",
                 "{task}",
             ],
             "workdir": _default_workdir("claude"),
