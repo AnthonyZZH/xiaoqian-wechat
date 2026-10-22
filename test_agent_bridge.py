@@ -541,6 +541,36 @@ class AgentBridgeTests(Temp):
             bot.agent_command(text)
             self.assertFalse([r for r in bot.relays if len(r) == 3], text)
 
+    def test_owner_says_in_a_group_by_short_name_with_an_at(self):
+        bot, wx = self.make()
+        bot.settings.update(chats={'示例好友': {'mode': 'private'}, '示例测试群': {'mode': 'group'}})
+        wx.chats['示例测试群'], wx.modes['示例测试群'] = [], 'group'
+        for text, chat, body in [('在测试群里艾特小王说：周末一起吃饭吗？', '示例测试群', '@小王 周末一起吃饭吗？'),
+                                 ('去测试群说：今晚八点', '示例测试群', '今晚八点'),
+                                 ('在示例测试群里@小李 说：早', '示例测试群', '@小李 早'),
+                                 ('到 文件传输助手 发：测试', '文件传输助手', '测试')]:
+            bot.relays.clear()
+            self.assertEqual(bot.agent_command(text), {'log': text, 'reply': None}, text)
+            self.assertEqual(bot.relays, [(chat, body, True)], text)
+        bot.relays.clear()
+        self.tick(bot)
+        self.owner_says(bot, wx, '在测试群里艾特小王说：周末一起吃饭吗？', ticks=3)
+        self.assertIn(('示例测试群', '@小王 周末一起吃饭吗？'), wx.sent)
+        self.assertEqual(wx.sent[-1], ('示例好友', '已发给「示例测试群」：@小王 周末一起吃饭吗？'))
+        self.assertEqual(self.prompts, [])
+
+    def test_short_chat_names_never_guess(self):
+        bot, _ = self.make()
+        bot.settings.update(chats={'示例好友': {'mode': 'private'}, '示例一群': {'mode': 'group'},
+                                   '示例二群': {'mode': 'group'}})
+        self.assertIsNone(bot.resolve_chat('示例群'))           # fits two: refuse
+        self.assertEqual(bot.resolve_chat('示例一群'), '示例一群')
+        self.assertEqual(bot.resolve_chat('A'), 'A')             # too short to guess: exact search
+        self.assertEqual(bot.resolve_chat('示例联系人'), '示例联系人')     # unwatched: exact search
+        bot.agent_command('去示例群说：今晚八点')
+        self.assertEqual(bot.relays, [])
+        self.assertEqual(bot.reports, ['「示例群」能对上好几个聊天，没发。请写完整的聊天名'])
+
     def test_owner_send_failure_is_reported_truthfully(self):
         bot, wx = self.make()
         self.tick(bot)

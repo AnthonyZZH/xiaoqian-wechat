@@ -14,9 +14,9 @@ Supports private chats, group chats, editable long-term memory, and stickers. Th
 - **Long-term memory:** stores people, group slang, and conversation style separately for each chat. Manual edits include backups and conflict detection.
 - **Images and stickers:** vision models can describe images and select stickers by their descriptions. Collected stickers enter a review queue.
 - **Web search:** DuckDuckGo HTML search with Bing as a fallback.
-- **Multiple chats:** monitors only allowlisted conversations and supports relays from a designated contact's private chat to an allowlisted group.
-- **Owner sends:** in the designated contact's private chat, "给某某发：…" sends that exact text to any WeChat chat found by exact name, without the model, and reports back whether it was really sent.
-- **Local agent tasks (optional):** the designated contact's private chat can hand a task to a local command-line agent (Claude Code, Codex or DeepSeek Harness) with an optional passphrase, and gets a one-line report when it finishes. See [docs/USAGE.md](docs/USAGE.md).
+- **Multiple chats:** monitors only allowlisted conversations and supports relays from a designated contact's private chat to other allowlisted chats.
+- **Owner sends:** in the designated contact's private chat, "给某某发：…" or "在某群里说：…" sends the text after the colon (whitespace collapsed) to any WeChat chat found by name (short group names are matched only when unambiguous), without the model, and reports back whether it was really sent.
+- **Local agent tasks (on by default, can be turned off):** the designated contact's private chat can hand a task to a local command-line agent (Claude Code, Codex or DeepSeek Harness) with an optional passphrase, and gets a one-line report when it finishes. See [docs/USAGE.md](docs/USAGE.md).
 
 ## Requirements
 

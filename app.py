@@ -32,6 +32,10 @@ JOB_STATES = {"running": "进行中", "done": "做完了", "failed": "失败了"
 # "给示例联系人私聊发：晚安" from the owner: the exact text, to exactly that chat, no model involved.
 OWNER_SEND = re.compile(r"(?:你)?(?:去|帮我|再)?(?:给|跟|向|对)\s*(?P<chat>[^\s:：,，]{1,40}?)\s*(?:私聊)?\s*"
                         r"(?:发消息|发个消息|发一句|发|说)\s*(?:说)?\s*[:：]\s*(?P<text>\S.*)")
+# "在测试群里艾特小王说：…" / "去测试群说：…": a group (short names allowed), optionally @someone.
+OWNER_SAY_IN = re.compile(r"(?:你)?(?:帮我|再)?(?:在|到|去|往)\s*(?P<chat>[^\s:：,，]{1,40}?)\s*(?:里面|里|中)?\s*"
+                          r"(?:(?:艾特|@|＠)\s*(?P<at>[^\s:：,，]{1,30}?)\s*)?"
+                          r"(?:发消息|发个消息|发一句|发|说)\s*(?:说)?\s*[:：]\s*(?P<text>\S.*)")
 NOT_A_CHAT = {"我", "你", "他", "她", "它", "大家", "我们", "你们", "他们"}
 
 
@@ -291,11 +295,17 @@ class Bot:
         With act=False (messages from a pause) nothing is sent, started or stopped.
         """
         line = " ".join(str(text).split())
-        send = OWNER_SEND.fullmatch(line)
+        send = OWNER_SEND.fullmatch(line) or OWNER_SAY_IN.fullmatch(line)
         if send and send["chat"] not in NOT_A_CHAT and send["chat"].casefold() not in AGENT_ALIASES:
             if act:
-                # Confirmed (or not) by a report once it has really been tried; never claimed early.
-                self.relays.append((send["chat"], send["text"], True))
+                chat, body = self.resolve_chat(send["chat"]), send["text"]
+                if send.groupdict().get("at"):
+                    body = f"@{send['at']} {body}"  # plain text: WeChat does not notify like a picked @
+                if chat is None:
+                    self.reports.append(f"「{send['chat']}」能对上好几个聊天，没发。请写完整的聊天名")
+                else:
+                    # Confirmed (or not) by a report once it has really been tried; never claimed early.
+                    self.relays.append((chat, body, True))
             return {"log": line, "reply": None}
         if not self.settings["agents_enabled"]:
             return None
@@ -310,6 +320,21 @@ class Bot:
             return None
         agent, task = parsed
         return {"log": f"给{agent} {' '.join(task.split())}", "reply": self.dispatch(agent, task) if act else None}
+
+    def resolve_chat(self, name):
+        """A watched chat the owner named in short ("测试群" → "示例测试群"), else `name` as typed.
+
+        None when the short name fits several watched chats. Unwatched names go to WeChat's
+        exact search unchanged, so nothing is ever sent to a merely similar chat.
+        """
+        chats = list(self.settings["chats"])
+        if name in chats:
+            return name
+        core = name[:-1] if name.endswith("群") and len(name) > 2 else name
+        hits = [c for c in chats if core in c] if len(core) >= 2 else []
+        if len(hits) > 1:
+            return None
+        return hits[0] if hits else name
 
     def agent_configs(self):
         configs = default_configs()
