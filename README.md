@@ -1,8 +1,8 @@
-# Xiaoqian · AI WeChat Companion
+# Xiaoqian · Local-LLM AI WeChat Group Chat Bot
 
 English | [简体中文](README.zh-CN.md)
 
-A Windows desktop companion for WeChat, powered by local models through LM Studio. It reads and sends messages through the WeChat interface, decides when to join a conversation, and replies using a configurable persona.
+Xiaoqian (小千) is an AI WeChat chatbot and group-chat companion for Windows, powered by a local LLM through LM Studio (e.g. Qwen). It drives the desktop WeChat 4.x client through UI automation — no hooking, injection or web protocol — reads the room before replying, opens topics on her own, keeps long-term memory, sends stickers, @mentions people for real, draws pictures, and can hand tasks to Claude Code or Codex.
 
 Supports private chats, group chats, editable long-term memory, and stickers. The control panel starts **paused**: choose a chat and start it yourself. This is an experimental project; WeChat updates, window layout, and display scaling can affect recognition.
 
@@ -16,6 +16,7 @@ Supports private chats, group chats, editable long-term memory, and stickers. Th
 - **Web search:** DuckDuckGo HTML search with Bing as a fallback.
 - **Multiple chats:** monitors only allowlisted conversations and supports relays from a designated contact's private chat to other allowlisted chats.
 - **Owner sends:** in the designated contact's private chat, "给某某发：…" or "在某群里说：…" sends the text after the colon (whitespace collapsed) to any WeChat chat found by name (short group names are matched only when unambiguous), without the model, and reports back whether it was really sent. @mentions are picked from WeChat's member list like a person would; free wording is read by the local model and then checked.
+- **Drawing:** "画一只橘猫" / "帮我画：…" gets a picture from Codex's image tool, sent back to the chat that asked. Group members who @ her get 3 a day; the owner has no limit.
 - **Blocking and memory on command:** "拉黑 X" / "解除拉黑 X" / "黑名单" and "总结记忆", in the private chat or by @-ing her in a group.
 - **Local agent tasks (on by default, can be turned off):** the designated contact's private chat can hand a task to a local command-line agent (Claude Code, Codex or DeepSeek Harness) with an optional passphrase, and gets a one-line report when it finishes. See [docs/USAGE.md](docs/USAGE.md).
 
@@ -119,6 +120,7 @@ Let conversation participants know they are interacting with an AI. Before publi
 
 Every update is tagged as a small version (`v0.x`); the full notes are in [CHANGELOG.md](CHANGELOG.md).
 
+- **v0.5** — Drawing: the owner or group members ask, Codex's image tool draws, the picture goes back to that chat; members get 3 a day, the owner has no limit.
 - **v0.4** — Opening topics on her own: a bubble in a group that has gone quiet, a message to the designated contact every few hours. The model decides whether to speak; quiet hours and unanswered limits apply, and the pacing survives restarts.
 - **v0.3** — Real @mentions picked from the member list; free-worded send requests read by the local model and checked; blocking and a block list; "总结记忆" on request, and memory updates that no longer fail on long-thinking models; stickers before small emoji, no repeats.
 - **v0.2** — Hand tasks to local agents (Claude Code / Codex / DeepSeek Harness) from the designated contact's chat; "给某某发：…" sends to any chat and reports truthfully; multi-chat relays.

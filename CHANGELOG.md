@@ -2,6 +2,12 @@
 
 Each update to this repository is tagged as a small version (`v0.1`, `v0.2`, …).
 
+## v0.5
+
+- Drawing: "画一只…" / "帮我画：…" from the owner (no limit) or from group members who @ her (`draw_daily_limit`, default 3 a day each). A dedicated `draw` agent runs Codex's image tool; the picture is found (`out.png`, else Codex's generated images), archived, and sent back to the chat that asked with the paste-image path. Failures are reported in that chat.
+- Group members can only ask for drawings; the owner's commands stay the owner's.
+- README titles and introductions describe the project in the terms people search for.
+
 ## v0.4
 
 - Opening topics on her own (`proactive.py`): a bubble in a group after it has been quiet for a while, and a message to the designated contact every few hours. When a chat is due she is only asked to consider it; the model may stay silent, which reschedules without counting.

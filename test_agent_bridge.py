@@ -5,6 +5,7 @@ Never runs claude/codex/deepseek, never touches data\\: every path is a temp fol
     python -m unittest test_agent_bridge -v
 """
 import json
+from pathlib import Path
 import sys
 import time
 import textwrap
@@ -26,6 +27,13 @@ AGENT = textwrap.dedent("""
         print("出错了：找不到表格", file=sys.stderr, flush=True)
         sys.exit(3)
 """)
+PAINTER = textwrap.dedent("""
+    import sys
+    from PIL import Image
+    if "画不出" not in sys.argv[1]:
+        Image.new("RGB", (8, 8), (240, 160, 60)).save("out.png")
+    print("done", flush=True)
+""")
 SUMMARY = "Claude 把报告整理好了，放在 C:\\work\\报告.md，" + "表格和结论都写进去了，" * 8 + "没有出错"
 
 
@@ -43,6 +51,11 @@ class WeChat(FakeWeChat):
         super().send("".join(f"@{m} " for m in at) + text, cancel)
         return missing
 
+    def send_image(self, path, cancel):
+        assert self.target == self.open and not cancel()
+        self.sent.append((self.open, 'IMG:' + Path(path).name))
+        self.post(self.open, '[图片]', role='assistant')
+
     def validate(self):
         pass
 
@@ -57,7 +70,9 @@ class AgentBridgeTests(Temp):
                         agent_overrides={name: {"cmd": [sys.executable, "-c", AGENT, "{task}"],
                                                 "workdir": str(self.dir / 'work' / name), "timeout": 20,
                                                 "env": {"PYTHONIOENCODING": "utf-8"}}
-                                         for name in ("claude", "codex", "deepseek")})
+                                         for name in ("claude", "codex", "deepseek")}
+                        | {"draw": {"cmd": [sys.executable, "-c", PAINTER, "{task}"], "workdir": str(self.dir / 'work' / 'draw'),
+                                    "timeout": 20, "env": {"PYTHONIOENCODING": "utf-8"}}})
         bot = Bot(settings, PersonaStore(self.dir / 'p'), reply_latest,
                   log_dir=self.dir / 'logs', data_dir=self.dir / 'data')
         self.addCleanup(self.stop_all, bot)
@@ -832,3 +847,77 @@ class AgentBridgeTests(Temp):
         self.tick(bot, 2)
         self.assertEqual(wx.sent, [])
         self.assertEqual(wx.open, '示例好友')
+
+    # ---- drawing: Codex's image tool, sent back where it was asked for ----
+    def test_owner_asks_for_a_drawing_in_private(self):
+        bot, wx = self.make()
+        self.tick(bot)
+        self.owner_says(bot, wx, '画一只橘猫')
+        self.assertEqual(wx.sent[-1], ('示例好友', '好，画好了发出来，大概要一分钟'))
+        job, = bot.agents.jobs()
+        self.assertEqual(job.agent, 'draw')
+        self.assertIn('一只橘猫', job.task)
+        self.wait_jobs(bot)
+        self.tick(bot, 3)
+        self.assertEqual(wx.sent[-1], ('示例好友', f'IMG:{job.id}.png'))
+        self.assertEqual(self.prompts, [])
+
+    def test_owner_asks_for_a_drawing_in_a_group(self):
+        bot, wx = self.make()
+        bot.settings.update(aliases=['机器人昵称'])
+        self.tick(bot)
+        wx.post('示例群甲', '@机器人昵称 帮我画：戴墨镜的柴犬', sender='示例好友')
+        self.tick(bot, 3)
+        self.assertIn(('示例群甲', '好，画好了发出来，大概要一分钟'), wx.sent)
+        self.wait_jobs(bot)
+        self.tick(bot, 4)
+        job, = bot.agents.jobs()
+        self.assertIn(('示例群甲', f'IMG:{job.id}.png'), wx.sent)
+        self.assertNotIn(('示例好友', f'IMG:{job.id}.png'), wx.sent)
+
+    def test_a_drawing_that_failed_is_said_so(self):
+        bot, wx = self.make()
+        self.tick(bot)
+        self.owner_says(bot, wx, '画一张画不出来的东西')
+        self.wait_jobs(bot)
+        self.tick(bot, 3)
+        self.assertIn('没画出来', wx.sent[-1][1])
+
+    def test_talking_about_drawing_is_not_a_request(self):
+        bot, wx = self.make([{'speak': True, 'to_me': True, 'text': '慢慢练嘛'}])
+        self.tick(bot)
+        self.owner_says(bot, wx, '画画好难', ticks=2)
+        self.assertEqual(bot.agents.jobs(), [])
+        self.assertEqual(wx.sent, [('示例好友', '慢慢练嘛')])
+
+    def test_group_members_draw_three_a_day_and_the_owner_any(self):
+        bot, wx = self.make()
+        bot.settings.update(aliases=['机器人昵称'])
+        self.tick(bot)
+        replies = []
+        for n in range(4):
+            wx.post('示例群甲', f'@机器人昵称 画一只第{n}号小狗', sender='阿杰')
+            self.tick(bot, 3)
+            replies.append(wx.sent[-1])
+            self.wait_jobs(bot)
+            self.tick(bot, 4)
+        self.assertEqual(replies[0], ('示例群甲', '阿杰 好，画好了发出来，大概要一分钟（今天还能画 2 张）'))
+        self.assertEqual(replies[3], ('示例群甲', '阿杰 今天已经画了 3 张啦，明天再来'))
+        self.assertEqual(len([j for j in bot.agents.jobs() if j.agent == 'draw']), 3)
+        self.assertEqual(sum(1 for c, s in wx.sent if c == '示例群甲' and s.startswith('IMG:')), 3)
+        for n in range(4):  # the owner is never limited
+            self.owner_says(bot, wx, f'画一只第{n}号小猫')
+            self.wait_jobs(bot)
+            self.tick(bot, 3)
+        self.assertEqual(len([j for j in bot.agents.jobs() if j.agent == 'draw']), 7)
+        self.assertEqual(self.prompts, [])
+
+    def test_members_cannot_use_owner_commands_in_a_group(self):
+        bot, wx = self.make()
+        bot.settings.update(aliases=['机器人昵称'])
+        self.tick(bot)
+        wx.post('示例群甲', '@机器人昵称 拉黑 示例好友', sender='阿杰')
+        wx.post('示例群甲', '@机器人昵称 总结记忆', sender='阿杰')
+        self.tick(bot, 3)
+        self.assertEqual(bot.settings['blocked'], [])
+        self.assertNotIn('记住了', ' '.join(s for _, s in wx.sent))

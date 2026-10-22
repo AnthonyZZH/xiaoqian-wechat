@@ -97,7 +97,7 @@ class Runner:
         # "reply": receipt or None}. Receipts and reports wait in `notices`.
         self.agent_command = lambda text, act=True: None
         # The owner's low-risk commands inside a group ("@小千 拉黑 X"), same contract.
-        self.group_command = lambda text, act=True: None
+        self.group_command = lambda text, act=True, sender="": None
         self.notices = deque()
         # Opening a topic on her own (a group bubble, a message to the owner), set by the
         # scheduler for one step: {"idle_minutes", "unanswered"}. The hooks report back to it.
@@ -249,9 +249,8 @@ class Runner:
         if self.blocked(sender):
             return False  # the owner said not to take in this person's messages at all
         self.on_heard()
-        owner = self.config.get("owner", "")
-        if self.mode == "group" and owner and sender == owner and getattr(row, "image", None) is None:
-            handled = self.group_command(row.text, act=not self.replaying)
+        if self.mode == "group" and sender and getattr(row, "image", None) is None:
+            handled = self.group_command(row.text, act=not self.replaying, sender=sender)
             if handled:
                 self.history.append({"role": "user", "text": handled["log"], "sender": sender})
                 self.emit("received", f"{sender}：{handled['log']}")
@@ -442,6 +441,25 @@ class Runner:
         self.sent(shown, proactive=True)
         self.status(f"已在「{self.chat}」说了（{why}）")
         return missing
+
+    def show(self, path, label="图片"):
+        """Send an image file here without asking the model (a drawing). Same rules as say()."""
+        if not self.enabled.is_set() or self.stop.is_set():
+            raise RuntimeError("已暂停，没有发图")
+        epoch = self.enabled.epoch
+
+        def cancel():
+            return self.stop.is_set() or not self.enabled.is_set() or self.enabled.epoch != epoch
+
+        self.recent_stickers.append((time.monotonic(), sticker_hash(path)))  # its echo is not news
+        try:
+            self.adapter.send_image(path, cancel=cancel)
+        except Exception:
+            self.enabled.clear()
+            self.emit("error", "发图未确认，已暂停。请检查微信，避免重复。")
+            raise
+        self.sent(f"[图片：{label}]", proactive=True)
+        self.status(f"已在「{self.chat}」发了图")
 
     def deliver(self):
         """Send notices oldest first; retry only failures known to occur before the click."""

@@ -58,6 +58,9 @@ DEFAULTS = {
     "agent_overrides": {},   # fields over agents.default_configs(), e.g. {"codex": {"model": "…"}}
     # Names whose messages she no longer takes in, in any chat ("拉黑 小李" from the owner).
     "blocked": [],
+    # Drawing (Codex's image tool): group members who @ her get this many pictures a day; the owner has no limit.
+    "draw_for_members": True,
+    "draw_daily_limit": 3,
 }
 
 

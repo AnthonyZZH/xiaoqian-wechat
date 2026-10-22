@@ -7,11 +7,12 @@
 - 每个任务把 stdout/stderr 合并后以 UTF-8（errors="replace"）完整写入
   log_dir/<job_id>.log，并在完成后调用 on_done(job)。
 
-默认三个 agent：
+默认四个 agent：
 - claude:   Claude Code 非交互模式（-p），--restricted 限制在 cwd 内，
             并且不启用 Bash/PowerShell，因此不会自动执行删除类命令。
 - codex:    Codex 应用自带的 codex-cli（每次启动重新 find_codex），
             exec + workspace-write 沙箱 + -C 工作目录。
+- draw:     与 codex 相同的命令，但使用独立工作目录和较短超时，专门生成图片。
 - deepseek: DeepSeek Harness 的 headless 模式，cwd 就是沙箱 workspaceRoot，
             DSH_PERMISSION_MODE=workspace-write。
 """
@@ -37,9 +38,11 @@ __all__ = [
     "DEFAULT_CONFIGS",
     "DEFAULT_ROUTES",
     "default_configs",
+    "draw_task",
     "find_claude",
     "find_codex",
     "find_dsh_paths",
+    "find_image",
     "parse_command",
 ]
 
@@ -308,7 +311,21 @@ def _default_workdir(agent: str) -> str:
 
 
 def default_configs() -> dict:
-    """三个默认 agent 配置的深拷贝。"""
+    """四个默认 agent 配置的深拷贝。"""
+    codex_cmd = [
+        "{codex}",
+        "exec",
+        "--skip-git-repo-check",
+        "-s",
+        "workspace-write",
+        "-m",
+        "{model}",
+        "-c",
+        "model_reasoning_effort={reasoning}",
+        "-C",
+        "{workdir}",
+        "{task}",
+    ]
     return {
         "claude": {
             # --restricted: 文件工具限制在 cwd（以及 --add-dir）内；
@@ -332,24 +349,18 @@ def default_configs() -> dict:
         "codex": {
             # 用户实测可用的 Codex 应用自带 codex-cli 调用方式。
             # {codex} 每次 start() 重新 find_codex()，{model}/{reasoning} 来自本配置。
-            "cmd": [
-                "{codex}",
-                "exec",
-                "--skip-git-repo-check",
-                "-s",
-                "workspace-write",
-                "-m",
-                "{model}",
-                "-c",
-                "model_reasoning_effort={reasoning}",
-                "-C",
-                "{workdir}",
-                "{task}",
-            ],
+            "cmd": list(codex_cmd),
             "workdir": _default_workdir("codex"),
             "timeout": 1800,
             "model": "gpt-6.1-sol",
             "reasoning": "high",
+        },
+        "draw": {
+            "cmd": list(codex_cmd),
+            "workdir": _default_workdir("draw"),
+            "timeout": 300,
+            "model": "gpt-6.1-sol",
+            "reasoning": "low",
         },
         "deepseek": {
             # 直接执行 dsh.cmd 内部等价的那条 Electron 命令：headless 单次任务。
@@ -372,6 +383,82 @@ def default_configs() -> dict:
 
 
 DEFAULT_CONFIGS = default_configs()
+
+
+# ---------------------------------------------------------------------------
+# 图片任务
+# ---------------------------------------------------------------------------
+
+_DRAW_DESCRIPTION_CHARS = 800
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def draw_task(description: str) -> str:
+    """把主人给的画面描述整理成只允许调用图片工具的单图任务。"""
+    clean = " ".join(str(description or "").split())
+    clean = clean[:_DRAW_DESCRIPTION_CHARS].rstrip()
+    if not clean:
+        clean = "一张简洁自然的图片"
+    return (
+        f"用图片生成工具画：{clean}\n"
+        "只生成一张图片，并保存为当前目录下的 out.png。\n"
+        "不许用代码、Pillow、SVG、Canvas、截图、下载现成图片或其他方式凑一张。\n"
+        "如果没有图片生成工具，只输出一行：NO_IMAGE_TOOL"
+    )
+
+
+def _recent_image(path: Path, earliest: float) -> tuple[float, Path] | None:
+    try:
+        if path.is_file() and path.suffix.casefold() in _IMAGE_SUFFIXES:
+            mtime = path.stat().st_mtime
+            if mtime >= earliest:
+                return mtime, path
+    except OSError:
+        pass
+    return None
+
+
+def find_image(job, workdir, generated_root=Path.home() / ".codex" / "generated_images") -> Path | None:
+    """找到本次画图结果，复制进任务工作目录的 images 文件夹。"""
+    folder = Path(workdir)
+    out = folder / "out.png"
+    earliest = float(job.started) - 2
+    found = _recent_image(out, earliest)
+
+    if found is None:
+        candidates = []
+        try:
+            for path in Path(generated_root).rglob("*"):
+                candidate = _recent_image(path, earliest)
+                if candidate is not None:
+                    candidates.append(candidate)
+        except OSError:
+            pass
+        if candidates:
+            found = max(candidates, key=lambda item: (item[0], str(item[1])))
+
+    if found is None:
+        try:
+            out.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("无法清理旧画图结果：%s", out, exc_info=True)
+        return None
+
+    source = found[1]
+    destination_dir = folder / "images"
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / f"{job.id}{source.suffix.casefold()}"
+    shutil.copy2(source, destination)
+
+    try:
+        out.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("无法清理画图临时文件：%s", out, exc_info=True)
+    return destination
 
 
 # ---------------------------------------------------------------------------

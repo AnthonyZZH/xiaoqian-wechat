@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agents import AgentJobs, DEFAULT_ROUTES, find_codex, parse_command
+from agents import AgentJobs, DEFAULT_ROUTES, default_configs, draw_task, find_codex, find_image, parse_command
 
 UTF8_ENV = {"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
 
@@ -30,6 +30,34 @@ class DefaultConfigTests(unittest.TestCase):
         from agents import default_configs
         cmd = default_configs()["claude"]["cmd"]
         self.assertEqual(cmd[-2:], ["--", "{task}"])
+
+    def test_draw_is_an_independent_low_reasoning_codex_agent(self):
+        configs = default_configs()
+        draw, codex = configs["draw"], configs["codex"]
+        self.assertEqual(draw["cmd"], codex["cmd"])
+        self.assertEqual(draw["model"], "gpt-6.1-sol")
+        self.assertEqual(draw["reasoning"], "low")
+        self.assertEqual(draw["timeout"], 300)
+        self.assertNotEqual(draw["workdir"], codex["workdir"])
+        self.assertEqual(Path(draw["workdir"]).name, "draw")
+
+
+class DrawTaskTests(unittest.TestCase):
+    def test_prompt_requires_one_real_image_and_named_output(self):
+        task = draw_task("一只戴围巾的猫")
+        self.assertIn("用图片生成工具画：一只戴围巾的猫", task)
+        self.assertIn("只生成一张图片", task)
+        self.assertIn("out.png", task)
+        self.assertIn("不许用代码", task)
+        self.assertEqual(task.splitlines()[-1], "如果没有图片生成工具，只输出一行：NO_IMAGE_TOOL")
+
+    def test_description_is_single_line_and_bounded(self):
+        task = draw_task("  猫\n穿毛衣\t" + "很" * 2000)
+        description = task.splitlines()[0].removeprefix("用图片生成工具画：")
+        self.assertTrue(description.startswith("猫 穿毛衣 "))
+        self.assertNotIn("\n", description)
+        self.assertNotIn("\t", description)
+        self.assertLessEqual(len(description), 800)
 
 
 class ParseCommandTests(unittest.TestCase):
@@ -506,6 +534,115 @@ class AgentJobsTests(unittest.TestCase):
         self.wait(manager, second)
 
         self.assertEqual([job.id for job in manager.jobs()], [second, first])
+
+    def test_fake_draw_agent_out_png_is_collected_and_removed(self):
+        script = """
+        from pathlib import Path
+        Path("out.png").write_bytes(bytes.fromhex("89504e470d0a1a0a") + b"fake-out")
+        """
+        manager, _, _ = self.make_jobs(self.make_config(script))
+        job_id = manager.start("fake", "画猫")
+        job = self.wait(manager, job_id)
+        workdir = self.root / "work"
+        generated = self.root / "generated"
+
+        result = find_image(job, workdir, generated)
+
+        self.assertEqual(result, workdir / "images" / f"{job.id}.png")
+        self.assertEqual(result.read_bytes(), bytes.fromhex("89504e470d0a1a0a") + b"fake-out")
+        self.assertFalse((workdir / "out.png").exists())
+
+    def test_generated_root_fallback_uses_newest_supported_image(self):
+        generated = self.root / "generated"
+        script = """
+        import os
+        import sys
+        import time
+        from pathlib import Path
+        root = Path(sys.argv[1]) / "session"
+        root.mkdir(parents=True)
+        older = root / "older.png"
+        older.write_bytes(b"older")
+        latest = root / "latest.webp"
+        latest.write_bytes(b"latest")
+        now = time.time()
+        os.utime(older, (now - 1, now - 1))
+        os.utime(latest, (now, now))
+        """
+        manager, _, _ = self.make_jobs(self.make_config(script))
+        job_id = manager.start("fake", str(generated))
+        job = self.wait(manager, job_id)
+
+        result = find_image(job, self.root / "work", generated)
+
+        self.assertEqual(result, self.root / "work" / "images" / f"{job.id}.webp")
+        self.assertEqual(result.read_bytes(), b"latest")
+
+    def test_old_images_are_ignored_and_old_out_is_cleaned(self):
+        generated = self.root / "generated"
+        script = """
+        import os
+        import sys
+        from pathlib import Path
+        Path("out.png").write_bytes(b"old-out")
+        root = Path(sys.argv[1])
+        root.mkdir(parents=True)
+        other = root / "old.jpg"
+        other.write_bytes(b"old-generated")
+        os.utime("out.png", (1, 1))
+        os.utime(other, (1, 1))
+        """
+        manager, _, _ = self.make_jobs(self.make_config(script))
+        job_id = manager.start("fake", str(generated))
+        job = self.wait(manager, job_id)
+
+        self.assertIsNone(find_image(job, self.root / "work", generated))
+        self.assertFalse((self.root / "work" / "out.png").exists())
+        self.assertFalse((self.root / "work" / "images").exists())
+
+    def test_no_image_returns_none(self):
+        manager, _, _ = self.make_jobs(self.make_config("print('NO_IMAGE_TOOL')"))
+        job_id = manager.start("fake", "画猫")
+        job = self.wait(manager, job_id)
+        self.assertIsNone(find_image(job, self.root / "work", self.root / "missing"))
+
+    def test_draw_and_codex_agents_can_run_at_the_same_time(self):
+        barrier = self.root / "barrier"
+        barrier.mkdir()
+        script = """
+        import os
+        import sys
+        import time
+        from pathlib import Path
+        root = Path(os.environ["AGENT_BARRIER"])
+        name = sys.argv[1]
+        other = "codex" if name == "draw" else "draw"
+        (root / (name + ".ready")).write_text("ready", encoding="utf-8")
+        deadline = time.monotonic() + 5
+        while not (root / (other + ".ready")).exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not (root / (other + ".ready")).exists():
+            raise SystemExit(2)
+        time.sleep(0.1)
+        """
+        configs = {}
+        for name in ("draw", "codex"):
+            configs[name] = {
+                "cmd": [sys.executable, "-c", textwrap.dedent(script), "{task}"],
+                "workdir": str(self.root / name),
+                "timeout": 10,
+                "env": {**UTF8_ENV, "AGENT_BARRIER": str(barrier)},
+            }
+        manager, _, _ = self.make_jobs(configs)
+
+        draw_id = manager.start("draw", "draw")
+        codex_id = manager.start("codex", "codex")
+        draw = self.wait(manager, draw_id)
+        codex = self.wait(manager, codex_id)
+
+        self.assertEqual(draw.status, "done")
+        self.assertEqual(codex.status, "done")
+        self.assertEqual({job.agent for job in manager.jobs()}, {"draw", "codex"})
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ from stickers import StickerLibrary
 from routing import ChatQueue, preview_text
 
 FONT = "Microsoft YaHei UI"
-AGENT_NAMES = {"claude": "Claude", "codex": "Codex", "deepseek": "DeepSeek"}
+AGENT_NAMES = {"claude": "Claude", "codex": "Codex", "deepseek": "DeepSeek", "draw": "画图"}
 AGENT_ALIASES = {key[1:].casefold(): agent for key, agent in DEFAULT_ROUTES.items()}  # "停掉codex"
 JOB_STATES = {"running": "进行中", "done": "做完了", "failed": "失败了", "timeout": "超时被停掉了",
               "stopped": "已经停掉了"}
@@ -42,6 +42,8 @@ UNBLOCK = re.compile(r"(?:解除拉黑|取消拉黑|解除屏蔽|取消屏蔽|�
 BLOCK = re.compile(r"(?:(?:不允许|不准|不许|不要|别)再?(?:接收|接受|理|回复|回|搭理|听)|拉黑|屏蔽)\s*"
                    r"(?P<name>.+?)\s*(?:的消息|的话|发的消息)?[。.!！]*")
 BLOCKLIST = re.compile(r"(?:看看|查看)?(?:黑名单|拉黑名单|屏蔽名单)[?？]*")
+# "画一只橘猫" / "帮我画：…": a picture by Codex's image tool, sent back where it was asked for.
+DRAW = re.compile(r"(?P<ask>请|你|帮我|给我|请你|你帮我|你给我)?画(?:一下)?\s*(?P<colon>[:：])?\s*(?P<what>.+)")
 LEARN_NOW = re.compile(r"(?:总结|整理|更新|保存|存)一?下?(?:你的|一下)?记忆[。.!！~～]*|记一下(?:刚才的?)?(?:聊天)?[。.!！]*")
 # Worth asking the local model whether the owner wants something sent (free wording only).
 SEND_HINT = re.compile(r"艾特|爱特|@|＠|转告|告诉|通知|招呼|问问|(?:给|跟|向|对|在|去|到).{0,20}?(?:发|说|讲|问)")
@@ -82,6 +84,8 @@ class Bot:
         self.runner = None
         self.runners = {}    # chat -> Runner, kept while switching so each chat keeps its place
         self.relays = []     # (chat, text) the owner asked her to say
+        self.drawings = {}   # job id -> (chat, what): pictures being drawn and where they go
+        self.pictures = []   # (chat, image path or None, what): finished, waiting to be sent
         self.previews = {}   # chat -> last seen session-list preview, to notice news elsewhere
         self.incoming = ChatQueue()
         self.route_retry = {}
@@ -191,6 +195,23 @@ class Bot:
         return next_chat is not None and self.incoming.priority(next_chat, chats, owner, self.runners.get(next_chat)) \
             < self.incoming.priority(runner.chat, chats, owner, runner)
 
+    def send_picture(self, chat, path, what):
+        """A finished drawing (or word that it failed) to the chat that asked; never anywhere else."""
+        from runner import NOTICE_CHARS
+        source = self.runner.chat
+        try:
+            self.go(chat, outbound=True)
+            if path:
+                self.runner.show(path, f"画的{what[:20]}")
+            else:
+                self.runner.say(f"「{what[:20]}」没画出来，可能是图片生成出错了，换个说法再试试", "画图", NOTICE_CHARS)
+        finally:
+            try:
+                self.go(source)
+            except Exception:
+                self.enabled.clear()
+                self.emit("error", "无法返回原聊天，已暂停；不会向其他聊天继续发送")
+
     def send_relay(self, chat, text, why="主人让我说的", limit=None, at=()):
         """One exact recipient, no model call in the destination, no fallback chat.
 
@@ -266,6 +287,13 @@ class Bot:
             else:
                 self.reports.pop(0)
                 self.report_retry_at = 0.0
+            return
+        if self.pictures and (chat is None or chat == current or priority(chat) > 0):
+            target, path, what = self.pictures.pop(0)
+            try:
+                self.send_picture(target, path, what)
+            except Exception as exc:
+                self.emit("error", f"画好的图没发到「{target}」：{exc}")
             return
         # The open chat's own waiting entry must not hold back what it asked for (single-chat mode).
         if self.relays and (chat is None or chat == current or priority(chat) > 0):
@@ -379,12 +407,10 @@ class Bot:
             return None
         return {"log": line, "reply": self.owner_send_from(line, wish)}
 
-    def group_command(self, text, act=True):
-        """The owner in a group, addressing her: only blocking and memory, never sends or agents.
-
-        Group sender names come from OCR and avatars, so anything that reaches other chats or
-        runs programs stays in the owner's private chat.
-        """
+    def group_command(self, text, act=True, sender=""):
+        """Someone in a group addressing her. The owner: blocking, memory and drawing; anyone else:
+        drawing within a daily allowance. Never sends elsewhere or other agent tasks from a group,
+        since group sender names come from OCR and avatars."""
         names = [self.runner.name] + [a for a in self.settings.get("aliases") or [] if a]
         line = " ".join(str(text).replace(" ", " ").split())
         called = [n for n in names if f"@{n}" in line]
@@ -392,11 +418,55 @@ class Bot:
             return None
         for n in called:
             line = line.replace(f"@{n}", " ")
-        return self.owner_command(" ".join(line.split()), act, here=self.runner, log=" ".join(str(text).split()))
+        line, log = " ".join(line.split()), " ".join(str(text).split())
+        if sender == self.settings["owner"]:
+            return self.owner_command(line, act, here=self.runner, log=log)
+        what = self.draw_wish(line)
+        if what is None or not self.settings.get("draw_for_members", True):
+            return None
+        if not act:
+            return {"log": log, "reply": None}
+        limit = int(self.settings.get("draw_daily_limit", 3))
+        used = self.draw_quota(sender)
+        if used >= limit:
+            return {"log": log, "reply": f"{sender} 今天已经画了 {used} 张啦，明天再来"}
+        reply = self.draw(what, self.runner)
+        if reply.startswith("好"):
+            self.draw_quota(sender, add=True)
+            reply = f"{sender} {reply}（今天还能画 {limit - used - 1} 张）"
+        return {"log": log, "reply": reply}
+
+    def draw_wish(self, line):
+        """What to draw, or None: "画画好难" is chat; a request needs 帮我画/画：/画一只…."""
+        draw = DRAW.fullmatch(line)
+        if not draw or not self.settings["agents_enabled"]:
+            return None
+        if draw["ask"] or draw["colon"] or re.match(r"[一两几个张幅只条朵位副]", draw["what"]):
+            return draw["what"]
+        return None
+
+    def draw_quota(self, sender, add=False):
+        """Pictures `sender` had drawn today (per group member name); `add` counts one more."""
+        path, today = self.data / "draw_quota.json", datetime.now().strftime("%Y-%m-%d")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        counts = data.get("counts", {}) if data.get("date") == today else {}
+        if add:
+            counts[sender] = counts.get(sender, 0) + 1
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_suffix(".tmp")
+            temp.write_text(json.dumps({"date": today, "counts": counts}, ensure_ascii=False), encoding="utf-8")
+            temp.replace(path)
+        return counts.get(sender, 0)
 
     def owner_command(self, line, act, here=None, log=None):
         """拉黑 / 解除拉黑 / 黑名单 / 总结记忆. `here`: the group it was said in, else the owner's chat."""
         log = log or line
+        what = self.draw_wish(line)
+        if what is not None:  # the owner: no daily allowance
+            return {"log": log, "reply": self.draw(what, here) if act else None}
         if BLOCKLIST.fullmatch(line):
             blocked = self.settings.get("blocked") or []
             return {"log": log, "reply": ("黑名单：" + "、".join(blocked) if blocked else "黑名单是空的") if act else None}
@@ -428,6 +498,33 @@ class Bot:
             runner.pending[:] = [m for m in runner.pending if not runner.blocked(getattr(m, "sender", ""))]
         return {"log": log, "reply": f"好，之后不再接收「{name}」的消息"
                 + ("" if seen else "（还没见过这个名字，按原样拉黑；名字要和群里显示的一致）")}
+
+    def draw(self, what, here=None):
+        """Hand a picture to Codex's image tool; it is sent to `here` (a group) or the owner when done."""
+        import agents
+        chat = here.chat if here else self.settings["owner"]
+        what = " ".join(what.split()).strip("。.!！~～")[:200]
+        if any(j.agent == "draw" and j.status == "running" for j in self.agents.jobs()):
+            return "上一张还在画，画完再说"
+        self.agents.configs = self.agent_configs()
+        try:
+            job_id = self.agents.start("draw", agents.draw_task(what))
+        except Exception as exc:
+            return f"没法画：{exc}"
+        self.drawings[job_id] = (chat, what)
+        self.emit("status", f"开始画：{what[:40]}")
+        return "好，画好了发出来，大概要一分钟"
+
+    def drawn(self, job):
+        """The finished picture's path, or None when nothing usable came out."""
+        import agents
+        if job.status != "done":
+            return None
+        try:
+            return agents.find_image(job, Path(self.agent_configs()["draw"]["workdir"]))
+        except Exception as exc:
+            self.emit("error", f"找不到画好的图：{exc}")
+            return None
 
     def learn_now(self, here=None):
         """The owner asked for memory to be updated now: this group, or every chat she has open."""
@@ -603,6 +700,10 @@ class Bot:
                 job = self.finished.get_nowait()
             except queue.Empty:
                 return
+            if job.id in self.drawings:
+                chat, what = self.drawings.pop(job.id)
+                self.pictures.append((chat, self.drawn(job), what))
+                continue
             self.reports.append(self.report(job))
             self.emit("status", f"{self.job_label(job)}{JOB_STATES.get(job.status, job.status)}，汇报会发到主人私聊")
 
