@@ -111,3 +111,11 @@ This application relies on a visible, stable desktop interface. Group nickname O
 The model loader switches only the bot's own model instance. The working-set trimming helper can affect other `llama-server` processes on the same machine; it is a memory-management aid, not a guarantee of lower resource usage.
 
 Let conversation participants know they are interacting with an AI. Before publishing your own changes, review staged files and exclude personal data, screenshots, logs, credentials, and machine-specific configuration.
+
+## Versions and contributors
+
+Every update is tagged as a small version; see [CHANGELOG.md](CHANGELOG.md).
+
+- [AnthonyZZH](https://github.com/AnthonyZZH) — maintainer
+- [Codex](https://github.com/codex) (OpenAI) — implementation, review and testing
+- Claude (Anthropic) — implementation and review
