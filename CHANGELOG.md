@@ -2,6 +2,16 @@
 
 Each update to this repository is tagged as a small version (`v0.1`, `v0.2`, …).
 
+## v0.8
+
+- Voice messages: a new voice row is transcribed with WeChat's own right-click voice-to-text before the model sees it; labels like '语音3"秒未播放' are no longer mistaken for a transcript, and voice rows keep a stable text so a chat is found again after switching.
+- Private chats are always answered: a decline, "not to me", a hush or a filtered line leads to one forced retry and then a short last-resort line. Groups and openings may still stay silent.
+- 重新接话 (run page): answer the other side's last messages, always speaking, without inventing their lines; receipts and relays are marked as notices in history.
+- Persona: lewd or perverted requests are refused and insults get a comeback aimed at what was said, within limits (no attacks on looks, origin, gender, region or illness, no slurs, no threats); the built-in 小千 carries the same rules.
+- A new contact whose chat list shows "你已添加了…" is anchored after that notice; a chat without any user message no longer breaks Qwen's chat template.
+- Image descriptions describe only what is visible, write 无配字 when there is no text, and do not guess character names.
+- Her own sticker read back as someone else's is recognised (trimmed fingerprints); test consoles free their Tk objects on the main thread.
+
 ## v0.7
 
 - Drawing rights are set per allowed chat in the console: enable or disable drawing, choose everyone or a name list in groups, set a daily limit and unlimited names, and reset today's counts. Private contacts are disabled until explicitly allowed; the owner remains unlimited.

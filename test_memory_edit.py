@@ -1,5 +1,6 @@
 """Offline tests: editing never reads real chats, loads models or sends messages."""
 import copy
+import gc
 import json
 import tempfile
 import tkinter as tk
@@ -119,6 +120,9 @@ class MemoryEditorFormTests(unittest.TestCase):
         from memory_editor import MemoryEditor
         root = tk.Tk()
         root.withdraw()
+        # Cleanups run last-in first-out: destroy, then free the Tk objects on this thread. Left
+        # to a later collection on an agent thread, Tcl aborts the run (Tcl_AsyncDelete).
+        self.addCleanup(gc.collect)
         self.addCleanup(root.destroy)
         data, token = self.memory.snapshot()
         submit = mock.Mock()
@@ -146,6 +150,9 @@ class MemoryEditorFormTests(unittest.TestCase):
         from memory_editor import MemoryEditor
         root = tk.Tk()
         root.withdraw()
+        # Cleanups run last-in first-out: destroy, then free the Tk objects on this thread. Left
+        # to a later collection on an agent thread, Tcl aborts the run (Tcl_AsyncDelete).
+        self.addCleanup(gc.collect)
         self.addCleanup(root.destroy)
         data, token = self.memory.snapshot()
         submit = mock.Mock()

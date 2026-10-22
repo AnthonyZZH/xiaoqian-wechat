@@ -9,6 +9,9 @@ Supports private chats, group chats, editable long-term memory, and stickers. Th
 ## Features
 
 - **Conversational participation:** batches consecutive messages and checks whether a reply is appropriate. Group participation considers mentions, recent context, and speaking frequency.
+- **Voice messages:** new voice messages are turned into text with WeChat's own voice-to-text before she replies, in private and group chats; audio is not sent anywhere else.
+- **Private chats are always answered:** if the model declines or its line is filtered, she is asked once more and has a short last-resort line. A 重新接话 button answers what the other side said last.
+- **A persona with a spine:** lewd or perverted requests are refused, insults get a comeback aimed at what was said, never at looks, origin, gender or region, and without slurs.
 - **Follow-ups and opening topics:** can continue private conversations after a delay, bubble up in a group that has gone quiet, and message the designated contact every few hours. When a chat is due the model decides whether anything is worth saying; quiet hours apply and she stops after openings nobody answers.
 - **Editable personas:** includes Xiaoqian, a cheerful and mildly sarcastic companion, and Awen, a gentler persona. Create and edit your own in the control panel.
 - **Long-term memory:** stores people, group slang, and conversation style separately for each chat. Progress survives restarts, and quiet chats are brought up to date periodically even when they are not open. Manual edits include backups and conflict detection.
@@ -121,6 +124,7 @@ Let conversation participants know they are interacting with an AI. Before publi
 
 Every update is tagged as a small version (`v0.x`); the full notes are in [CHANGELOG.md](CHANGELOG.md).
 
+- **v0.8** — Voice messages through WeChat's own voice-to-text; private chats always answered and a 重新接话 button; a persona that refuses lewd requests and hits back at insults; a new contact's first visit finds its place; image descriptions no longer invent captions or names; no more Tk crashes in the test run.
 - **v0.7** — Drawing rights and limits per allowed chat, live drawing-job states, a chat selector that stays synchronized, and periodic memory updates for every allowed chat with progress restored after restart.
 - **v0.6** — Real work mentioned in the owner's chat is handed to an agent (drawings to the draw agent, the rest to Codex) instead of being promised; drawings can look up references online first; a 画图 console tab shows where pictures are, previews, opens and deletes them.
 - **v0.5** — Drawing: the owner or group members ask, Codex's image tool draws, the picture goes back to that chat; members get 3 a day, the owner has no limit.

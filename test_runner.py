@@ -12,8 +12,8 @@ from runner import Runner
 from settings import Settings
 
 
-def row(key, text='今天不想学习', role='user', sender='', image=None):
-    return SimpleNamespace(key=key, text=text, role=role, sender=sender, image=image)
+def row(key, text='今天不想学习', role='user', sender='', image=None, voice=None, odd=False):
+    return SimpleNamespace(key=key, text=text, role=role, sender=sender, image=image, voice=voice, odd=odd)
 
 
 def stripes():
@@ -39,6 +39,9 @@ class FakeAdapter:
 
     def read(self):
         return self.rows[:]
+
+    def transcribe(self, message):
+        return "[语音：明天几点见]"
 
     def send(self, text, cancel):
         if cancel():
@@ -106,6 +109,19 @@ class PrivateTests(Base):
         self.runner.step()
         self.assertEqual(self.adapter.sent, [])
 
+    def test_new_voice_is_transcribed_before_the_model_sees_it(self):
+        self.adapter.rows.append(row('voice', '[语音]', voice=object()))
+        self.runner.step()
+        self.assertEqual(self.calls[0][0], ['[语音：明天几点见]'])
+        self.assertEqual(self.adapter.sent, ['接到了1'])
+
+    def test_unknown_private_message_gets_fallback_when_model_declines(self):
+        self.runner.brain.decide = lambda *a, **k: {'speak': False, 'to_me': False, 'text': '', 'sticker': ''}
+        self.adapter.rows.append(row('odd', '[微信暂时看不懂这条消息]', odd=True))
+        self.runner.step()
+        self.assertEqual(len(self.adapter.sent), 1)
+        self.assertTrue(any(word in self.adapter.sent[0] for word in ('有病', '什么鬼', '你干嘛')))
+
     def test_reply_latest_answers_only_last_user_message(self):
         runner = self.make(reply_latest=True)
         runner.step(); runner.step()
@@ -143,18 +159,20 @@ class PrivateTests(Base):
         self.assertEqual(self.adapter.sent, ['接到了1'])
         self.assertEqual(self.calls[0][0][-2:], ['我跟你说', '今天又迟到了'])
 
-    def test_silence_request(self):
+    def test_silence_request_still_gets_an_answer_in_private(self):
         self.add(text='别回复了')
         self.runner.step()
+        self.assertTrue(self.runner.muted)
+        self.assertEqual(self.adapter.sent, ['接到了1'])  # the owner's rule: a private chat is always answered
         self.runner.next_proactive = 0
         self.runner.step()
-        self.assertEqual((self.adapter.sent, self.calls), ([], []))
+        self.assertEqual(len(self.adapter.sent), 1)  # but no follow-up after being told to stop
 
     def test_silence_uses_current_persona_name(self):
         self.settings.update(persona='阿温')
         self.add(text='阿温闭嘴')
         self.runner.step()
-        self.assertEqual(self.adapter.sent, [])
+        self.assertTrue(self.runner.muted)
 
     def test_pause_before_step_never_reads_or_sends(self):
         self.add(); self.enabled.clear()
@@ -264,43 +282,57 @@ class PrivateTests(Base):
         self.runner.step()
         self.assertEqual(self.adapter.sent, ['接到了1'])
 
-    def test_no_proactive_after_model_chose_silence(self):
-        self.runner.brain.decide = lambda *a, **kw: dict(speak=False, text='', seconds=0)
+    def test_a_private_message_is_answered_even_if_the_model_declines(self):
+        from runner import MUST_REPLIES
+        asked = []
+        def decide(*a, force=False, **kw):
+            asked.append(force)
+            return dict(speak=False, text='', seconds=0)
+        self.runner.brain.decide = decide
         self.add(); self.runner.step()
+        self.assertEqual(asked, [False, True])  # asked once more, insisting
+        self.assertEqual(len(self.adapter.sent), 1)
+        self.assertIn(self.adapter.sent[0], MUST_REPLIES)  # then a short line of last resort
         self.runner.next_proactive = 0
         self.runner.step()
-        self.assertEqual(self.adapter.sent, [])
+        self.assertEqual(len(self.adapter.sent), 1)  # still no unprompted follow-up
 
     def test_duplicate_reply_text_not_sent(self):
+        from runner import MUST_REPLIES
         self.runner.brain.decide = lambda *a, **kw: dict(speak=True, text='同一句', seconds=0)
         self.add(); self.runner.step()
         self.add('two', '再说一句'); self.runner.step()
-        self.assertEqual(self.adapter.sent, ['同一句'])
+        self.assertEqual(self.adapter.sent[0], '同一句')
+        self.assertIn(self.adapter.sent[1], MUST_REPLIES)  # never the same line twice, never no answer
 
     def test_reworded_repeat_not_sent(self):
         texts = iter(['小公主？我平时不都是拿话扎你的吗，这形象管理也太崩了',
                       '小公主？本宫平时不都是拿话扎你的吗，别突然给我加滤镜'])
         self.runner.brain.decide = lambda *a, **kw: dict(speak=True, text=next(texts), seconds=0)
+        texts = iter(['小公主？我平时不都是拿话扎你的吗，这形象管理也太崩了',
+                      '小公主？本宫平时不都是拿话扎你的吗，别突然给我加滤镜', '行吧，这次就当你说的是真心话'])
+        self.runner.brain.decide = lambda *a, **kw: dict(speak=True, text=next(texts), seconds=0)
         self.add(); self.runner.step()
         self.add('two', '你永远是我的小公主'); self.runner.step()
-        self.assertEqual(len(self.adapter.sent), 1)
+        self.assertEqual(self.adapter.sent[1], '行吧，这次就当你说的是真心话')  # the reworded repeat never
 
-    def test_not_addressed_to_her_stays_silent(self):
+    def test_private_is_answered_even_when_not_addressed_to_her(self):
         self.runner.brain.decide = lambda *a, **kw: dict(speak=True, to_me=False, text='硬接一句', seconds=0)
         self.add(text='哈哈哈'); self.runner.step()
-        self.assertEqual(self.adapter.sent, [])
+        self.assertEqual(self.adapter.sent, ['硬接一句'])
 
     def test_cut_off_reply_not_sent(self):
         texts = iter(['你发了个', '好的', '行了', '你发了个占位图让我锐评啊'])
         self.runner.brain.decide = lambda *a, **kw: dict(speak=True, text=next(texts), seconds=0)
-        for i in range(4):
+        for i in range(3):
             self.add(f'k{i}', f'第{i}句'); self.runner.step()
+        # Half a sentence is dropped; a private chat is still answered, by asking once more.
         self.assertEqual(self.adapter.sent, ['好的', '行了', '你发了个占位图让我锐评啊'])
 
     def test_overlong_reply_not_sent(self):
         self.settings.update(max_reply_chars=3)
         self.add(); self.runner.step()
-        self.assertEqual(self.adapter.sent, [])
+        self.assertEqual(self.adapter.sent, ['我在呢'])  # the model's long lines never; the one short enough
 
     def test_three_model_failures_pause_and_resume_resets(self):
         def fail(*a, **kw):
@@ -474,10 +506,12 @@ class MediaTests(Base):
         self.assertEqual(self.adapter.sent, ['行吧[旺柴]'])
 
     def test_recent_small_emoji_only_reply_becomes_silence(self):
+        from runner import MUST_REPLIES
         self.runner.history = [{'role': 'assistant', 'text': '刚才用过[白眼]'}]
         self.reply(text=' [白眼] ')
         self.add(); self.runner.step()
-        self.assertEqual(self.adapter.sent, [])
+        self.assertNotIn(' [白眼] ', self.adapter.sent)
+        self.assertIn(self.adapter.sent[0], MUST_REPLIES)  # emptied, so the private chat gets a short line
 
     def test_removed_emoji_only_text_still_allows_a_sticker(self):
         self.runner.history = [{'role': 'assistant', 'text': '刚才用过[白眼]'}]
@@ -492,6 +526,24 @@ class MediaTests(Base):
         self.add(); self.runner.step()
         self.assertEqual(self.adapter.sent, ['现在可以了[白眼]'])
 
+    def test_a_chat_without_any_user_message_still_gets_one(self):
+        # Qwen's template raises "No user query found in messages" otherwise (seen live: 重新接话
+        # in a new contact's chat).
+        from brain import Brain
+        brain = Brain(self.settings, None, None, log_path=Path(self.temp.name) / 'calls.jsonl')
+        persona = type('P', (), {'name': '小千', 'prompt': '你是小千'})()
+        messages = brain.messages(persona, [], '新朋友', 'private', True, False, opening={'resume': []})
+        self.assertEqual([m['role'] for m in messages], ['system', 'user', 'system'])
+        messages = brain.messages(persona, [{'role': 'user', 'text': '你好'}], '新朋友', 'private', False, False)
+        self.assertEqual([m['role'] for m in messages], ['system', 'user', 'system'])
+
+    def test_resume_prompt_quotes_the_other_side_and_insists(self):
+        from brain import resume_situation
+        text = resume_situation(['周末去爬山吗', '小王：我带零食'])
+        self.assertIn('对方最近说的是', text)
+        self.assertIn('- 小王：我带零食', text)
+        self.assertIn('speak=true', text)
+
     def test_sticker_only_reply(self):
         self.reply(sticker='eyeroll')
         self.add(); self.runner.step()
@@ -504,13 +556,15 @@ class MediaTests(Base):
         self.settings.update(stickers_enabled=True)
         self.reply(sticker='nope')
         self.add('two', '再来'); self.runner.step()
-        self.assertEqual(self.adapter.sent, [])
+        self.assertNotIn('IMG:eyeroll.png', self.adapter.sent)
+        self.assertEqual(len(self.adapter.sent), 2)  # no sticker, but each private message answered
 
     def test_same_sticker_not_repeated_back_to_back(self):
         self.reply(sticker='eyeroll')
         self.add(); self.runner.step()
         self.add('two', '哈哈'); self.runner.step()
-        self.assertEqual(self.adapter.sent, ['IMG:eyeroll.png'])
+        self.assertEqual(self.adapter.sent.count('IMG:eyeroll.png'), 1)
+        self.assertEqual(len(self.adapter.sent), 2)  # answered with words instead
 
     def test_own_sticker_misread_as_incoming_is_ignored(self):
         self.reply(sticker='eyeroll')

@@ -941,6 +941,12 @@ class Bot:
             # On its own thread: a big folder takes many minutes and chats must not wait.
             self.scanning = threading.Thread(target=self.scan_stickers, daemon=True)
             self.scanning.start()
+        elif name == "resume":
+            if not self.enabled.is_set():
+                self.emit("status", "先点“开始 / 继续”，再让她重新接话")
+            else:
+                self.runner.resume_once = True
+                self.emit("status", f"让她在「{self.runner.chat}」重新接话…")
         elif name == "learn":
             if not self.runner.learn(time.monotonic(), force=True):
                 self.emit("status", "没有新的聊天可整理，或记忆功能已关闭")
@@ -1091,6 +1097,7 @@ class App:
         bar2.pack(fill="x", pady=10)
         ttk.Button(bar2, text="开始 / 继续", command=self.start).pack(side="left")
         ttk.Button(bar2, text="暂停", command=self.pause).pack(side="left", padx=8)
+        ttk.Button(bar2, text="重新接话", command=lambda: self.bot.command("resume")).pack(side="left")
         ttk.Button(bar2, text="清空当前聊天上下文", command=self.clear_history).pack(side="left", padx=8)
         ttk.Button(bar2, text="退出", command=self.quit).pack(side="right")
         ttk.Label(frame, wraplength=700, foreground="#777", text=(

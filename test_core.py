@@ -1,3 +1,4 @@
+import gc
 import json
 import unittest
 from pathlib import Path
@@ -376,6 +377,15 @@ class InboxTests(Temp):
         self.assertEqual(lib.files(), {})
 
 
+def close_window(app):
+    """Destroy a test console and free its Tk objects now, on the main thread: left for a later
+    garbage collection, they may be freed on an agent thread and Tcl aborts the run
+    ("Tcl_AsyncDelete: async handler deleted by the wrong thread")."""
+    app.window.destroy()
+    app.__dict__.clear()
+    gc.collect()
+
+
 class FakeWeChat:
     """Several chats; only the open one can be read or written, like the real UI."""
 
@@ -451,7 +461,7 @@ class SchedulerTests(Temp):
         self.assertEqual(wx.sent, [('示例好友', '好嘞我去说'), ('示例群甲', '主人说今晚聚餐改到八点哦')])
         self.assertEqual(self.prompts[0]['relay_targets'], ['示例群甲'])
         group = bot.runners['示例群甲']
-        self.assertEqual(group.history[-1], {'role': 'assistant', 'text': '主人说今晚聚餐改到八点哦'})
+        self.assertEqual(group.history[-1], {'role': 'assistant', 'text': '主人说今晚聚餐改到八点哦', 'notice': True})
 
     def test_news_in_another_chat_is_visited_and_answered(self):
         bot, wx = self.make([{'speak': True, 'to_me': True, 'text': '来了'}])
@@ -529,7 +539,7 @@ class StickerDescTests(Temp):
             app.save_sticker_desc()
             self.assertEqual(dict(bot.stickers.catalog()), {'狗头': '新描述'})
         finally:
-            app.window.destroy()
+            close_window(app)
 
 
 class RhythmSettingsTests(Temp):
@@ -552,7 +562,7 @@ class RhythmSettingsTests(Temp):
             self.assertEqual(bot.settings['initiative_quiet_hours'],
                              {'private': '23-7', 'group': '0-6'})
         finally:
-            app.window.destroy()
+            close_window(app)
 
 
 class GalleryTests(Temp):
@@ -579,7 +589,7 @@ class GalleryTests(Temp):
             self.assertFalse((folder / 'draw-1.png').exists())
             self.assertIn('还没有画过图', app.gallery_list.get(0))
         finally:
-            app.window.destroy()
+            close_window(app)
 
 
 class DrawRightsTests(Temp):
@@ -631,7 +641,7 @@ class DrawRightsTests(Temp):
             self.assertEqual(list(app.draw_chat['values']), [])
             self.assertEqual(app.draw_chat.get(), '')
         finally:
-            app.window.destroy()
+            close_window(app)
 
 
 class LMStudioTests(unittest.TestCase):
@@ -718,6 +728,100 @@ class DateLocaleTests(unittest.TestCase):
         with mock.patch('brain.datetime') as clock:
             clock.now.return_value.astimezone.return_value = Timestamp()
             self.assertEqual(now_line(), '现在是本机时间 2026年01月02日 星期五 03:04（UTC）。')
+
+
+class VoiceMessageTests(unittest.TestCase):
+    class Rect:
+        def __init__(self, left=0, top=0, right=600, bottom=500):
+            self.left, self.top, self.right, self.bottom = left, top, right, bottom
+
+        def width(self):
+            return self.right - self.left
+
+    class Control:
+        def __init__(self, name='', kind='TextControl', children=(), class_name='', rect=None, runtime=(1,)):
+            self.Name, self.ControlTypeName, self.ClassName = name, kind, class_name
+            self.AutomationId = ''
+            self.BoundingRectangle = rect or VoiceMessageTests.Rect()
+            self.runtime = runtime
+            self.children = list(children)
+
+        def GetChildren(self):
+            return self.children
+
+        def GetRuntimeId(self):
+            return self.runtime
+
+    def test_reads_existing_private_and_group_transcriptions(self):
+        from wechat_adapter import voice_text
+        private = self.Control('语音4秒', children=(self.Control('4秒'), self.Control('明天见')))
+        group = self.Control('[语音] 6秒', children=(self.Control('小王'), self.Control('6秒'),
+                                                       self.Control('我马上到')))
+        named = self.Control('语音3秒别催啦')
+        self.assertEqual(voice_text(private, 'private'), '明天见')
+        self.assertEqual(voice_text(group, 'group'), '我马上到')
+        self.assertEqual(voice_text(named, 'private'), '别催啦')
+
+    def test_status_is_not_mistaken_for_transcription(self):
+        from wechat_adapter import clean_voice_text, voice_text
+        item = self.Control('语音4秒', children=(self.Control('4秒'), self.Control('转换中')))
+        self.assertEqual(voice_text(item, 'private'), '')
+        self.assertEqual(clean_voice_text('转换失败'), '')
+
+    def test_unplayed_and_played_labels_of_wechat_41_are_not_transcripts(self):
+        # Seen live: an unplayed voice row is named '语音3"秒未播放'; after voice-to-text it
+        # becomes '语音3"秒在吗，晚上一起吃饭？'.
+        from wechat_adapter import voice_text
+        for name in ('语音3"秒未播放', '语音3"秒', '语音12"秒已播放', '语音3"未播放'):
+            self.assertEqual(voice_text(self.Control(name), 'private'), '', name)
+        self.assertEqual(voice_text(self.Control('语音3"秒在吗，晚上一起吃饭？'), 'private'), '在吗，晚上一起吃饭？')
+
+    def test_private_unknown_row_becomes_an_odd_message_but_group_ignores_it(self):
+        import wechat_adapter as wa
+        avatar = self.Control('好友', 'ButtonControl', rect=self.Rect(10, 20, 50, 55))
+        item = self.Control('', 'ListItemControl', (avatar,), 'mmui::BrandNewMessageView',
+                            self.Rect(0, 10, 600, 70))
+        listing = self.Control('', 'ListControl', (item,), rect=self.Rect())
+        listing.Exists = lambda timeout: True
+        window = type('Window', (), {'NativeWindowHandle': 123,
+                                     'ListControl': lambda self, **kwargs: listing})()
+        adapter = wa.WeChatAdapter.__new__(wa.WeChatAdapter)
+        adapter.target, adapter.window, adapter.row_cache, adapter.sender_cache = '好友', window, {}, {}
+        adapter.validate = lambda: None
+        with mock.patch.object(wa, 'visible_point', return_value=True), \
+                mock.patch.object(wa._user32, 'GetDpiForWindow', return_value=96):
+            adapter.mode = 'private'
+            rows = adapter.read()
+            self.assertEqual([(r.text, r.odd) for r in rows], [(wa.UNKNOWN_MESSAGE, True)])
+            adapter.mode, adapter.row_cache = 'group', {}
+            self.assertEqual(adapter.read(), [])
+
+    def test_transcribe_uses_wechat_menu_and_waits_for_text(self):
+        from types import SimpleNamespace
+        import wechat_adapter as wa
+
+        item = self.Control('语音3秒')
+        item.BoundingRectangle = self.Rect()
+        item.clicked = False
+        def right_click(**kwargs):
+            item.clicked = True
+        item.RightClick = right_click
+
+        option = SimpleNamespace(Exists=lambda timeout: True)
+        def click(**kwargs):
+            item.Name = '语音3秒明天见'
+        option.Click = click
+        adapter = wa.WeChatAdapter.__new__(wa.WeChatAdapter)
+        adapter.mode = 'private'
+        adapter.window = SimpleNamespace(SetActive=lambda **kwargs: None)
+        adapter.validate = lambda: None
+        adapter.restore = lambda previous: None
+        message = SimpleNamespace(text='[语音]', voice=item)
+        with mock.patch.object(wa, 'foreground', return_value=7), \
+                mock.patch.object(wa.auto, 'MenuItemControl', return_value=option), \
+                mock.patch.object(wa.time, 'sleep', return_value=None):
+            self.assertEqual(adapter.transcribe(message, timeout=0.2), '[语音：明天见]')
+        self.assertTrue(item.clicked)
 
 
 class OcrTests(unittest.TestCase):

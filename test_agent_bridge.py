@@ -280,7 +280,7 @@ class AgentBridgeTests(Temp):
         self.assertTrue(report.startswith('Claude「写报告」做完了：Claude 把报告整理好了'), report)
         self.assertGreater(len(report), 100)
         self.assertIn('改好了', self.summaries[0].tail)
-        self.assertEqual(bot.runners['示例好友'].history[-1], {'role': 'assistant', 'text': report})
+        self.assertEqual(bot.runners['示例好友'].history[-1], {'role': 'assistant', 'text': report, 'notice': True})
 
     def test_report_switches_to_the_owner_chat_in_multi_chat(self):
         bot, wx = self.make([{'speak': True, 'to_me': True, 'text': '来了'}])
@@ -1104,4 +1104,68 @@ class AgentBridgeTests(Temp):
         self.assertEqual(bot.runners['示例好友'].unlearned, 0)
         bot.learn_check_at = 0
         self.tick(bot)
-        self.assertEqual(learned, ['示例好友'])
+        self.assertEqual(learned, ['示例好友'])  # the group has only 1 new, 示例好友 was just updated
+
+    # ---- 重新接话: pick the thread up again from her own last lines ----
+    def test_resume_answers_what_the_other_side_said_last(self):
+        replies = [{'speak': True, 'to_me': True, 'text': f'我说的第{n}句话呀'} for n in range(6)]
+        bot, wx = self.make(replies + [{'speak': True, 'to_me': True, 'text': '那你周末到底去不去'}])
+        self.tick(bot)
+        for n in range(6):
+            self.owner_says(bot, wx, f'主人第{n}句', ticks=2)
+        self.owner_says(bot, wx, '给文件传输助手发：测试', ticks=3)  # a receipt is not her own talk
+        plan = self.with_plan(bot)
+        users = sum(r['role'] == 'user' for r in bot.runner.history)
+        bot.handle(('resume',))
+        self.tick(bot)
+        self.assertEqual(self.prompts[-1]['opening'],
+                         {'resume': ['主人第2句', '主人第3句', '主人第4句', '主人第5句', '给文件传输助手发：测试']})
+        self.assertEqual(wx.sent[-1], ('示例好友', '那你周末到底去不去'))
+        self.assertEqual(sum(r['role'] == 'user' for r in bot.runner.history), users)  # nothing made up
+        self.assertIn(('spoke', '示例好友', False), plan.calls)  # not counted as her own opening
+        self.tick(bot)
+        self.assertEqual(len(self.prompts), 7)  # one request, one turn
+
+    def test_resume_always_says_something_and_needs_her_running(self):
+        from runner import MUST_REPLIES
+        bot, wx = self.make([{'speak': False, 'to_me': True, 'text': ''}] * 2)
+        bot.settings.update(aliases=['机器人昵称'])
+        self.tick(bot)
+        bot.go('示例群甲')  # even in a group, 重新接话 is the owner asking her to speak
+        bot.runner.step()  # first visit: anchor only
+        plan = self.with_plan(bot)
+        bot.handle(('resume',))
+        bot.runner.step()
+        self.assertEqual(self.prompts[-1].get('force'), True)  # asked once more, insisting
+        self.assertIn(wx.sent[-1][1], MUST_REPLIES)
+        self.assertEqual(wx.sent[-1][0], '示例群甲')
+        self.assertNotIn(('declined', '示例群甲'), plan.calls)
+        bot.enabled.clear()
+        bot.handle(('resume',))
+        self.assertFalse(bot.runner.resume_once)
+
+    def test_groups_may_still_stay_out_of_it(self):
+        bot, wx = self.make([{'speak': False, 'to_me': False, 'text': ''}])
+        bot.settings.update(aliases=['机器人昵称'])
+        self.tick(bot)
+        wx.post('示例群甲', '你们吃了吗', sender='阿杰')
+        self.tick(bot, 3)
+        self.assertNotIn('示例群甲', [chat for chat, _ in wx.sent])
+        self.assertTrue(all(not p.get('force') for p in self.prompts))
+
+    def test_a_new_contact_whose_last_line_is_a_system_notice(self):
+        bot, wx = self.make()
+        bot.settings.update(chats={'示例好友': {'mode': 'private'}, '示例群甲': {'mode': 'group'},
+                                   '新朋友': {'mode': 'private'}})
+        wx.chats['新朋友'], wx.modes['新朋友'] = [], 'private'
+        wx.post('新朋友', '我是新朋友')  # the friend request's greeting
+        wx.post('新朋友', '你好')
+        wx.open_chat('新朋友')
+        runner = bot.runner_for('新朋友')
+        wx.set_target('新朋友', 'private')
+        wx.system_marks = [(1, '你已添加了新朋友，现在可以开始聊天了。')]  # between the two, as WeChat shows it
+        runner.prime(wx.read(), baseline='你已添加了新朋友，现在可以开始聊天了。')
+        self.assertEqual([m.text for m in runner.pending], ['你好'])
+        wx.system_marks = []
+        with self.assertRaises(RuntimeError):  # still fail closed when nothing matches at all
+            bot.runner_for('示例群甲').prime(wx.read(), baseline='谁也没说过的话')

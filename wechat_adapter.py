@@ -56,6 +56,8 @@ class Message:
     role: str
     sender: str = ""
     image: object = None  # PIL crop of a sticker/picture bubble, for incoming media only
+    voice: object = None  # UI row for a new incoming voice message; converted lazily by Runner
+    odd: bool = False  # private message type WeChat exposed but the adapter could not understand
 
 
 TEXT_ITEM = "mmui::ChatTextItemView"
@@ -67,6 +69,41 @@ CONTENT_ITEMS = {TEXT_ITEM, "mmui::ChatBubbleReferItemView", "mmui::ChatBubbleIt
 SYSTEM_ITEMS = {"mmui::ChatItemView", "mmui::ChatSystemInfoItemView"}
 MEDIA_ITEM = re.compile(r"Emoti|Emoji|Sticker|Image|Picture|Photo|Gif", re.I)
 MEDIA_NAME = re.compile(r"^\[?(?:动画表情|表情|图片|视频|Sticker|Photo|Image|Video)\]?")
+VOICE_NAME = re.compile(
+    # WeChat 4.1 names an unplayed row '语音3"秒未播放': the duration mark is a quote and/or 秒.
+    r"^\[?(?:语音|語音|Audio|Voice)\]?\s*\d+\s*(?:[\"”″']\s*秒?|秒|s(?:ec(?:ond)?s?)?)\s*(?P<text>.*)$",
+    re.I,
+)
+VOICE_CLASS = re.compile(r"Voice|Audio", re.I)
+VOICE_FAILED = "[语音：微信没能转成文字]"
+UNKNOWN_MESSAGE = "[微信暂时看不懂这条消息]"
+VOICE_STATUS = re.compile(
+    r"^秒?(?:未播放|已播放|语音转文字|語音轉文字|转换中|轉換中|转文字中|轉文字中|"
+    r"未能转换|未能轉換|转换失败|轉換失敗|无法识别|無法識別|Voice to Text|Converting)$",
+    re.I,
+)
+
+
+def clean_voice_text(text):
+    """A real transcription, or an empty string for duration/status labels."""
+    text = " ".join(str(text or "").split()).strip(" ：:")
+    text = re.sub(r"^(?:语音转文字|語音轉文字|转换结果|轉換結果|Voice to Text)\s*[：:]?\s*", "", text,
+                  flags=re.I)
+    return "" if not text or VOICE_NAME.match(text) or VOICE_STATUS.fullmatch(text) else text
+
+
+def voice_text(item, mode):
+    """Read a transcription already shown under a WeChat voice bubble."""
+    match = VOICE_NAME.match((item.Name or "").strip())
+    if match:
+        text = clean_voice_text(match.group("text"))
+        if text:
+            return text
+    names = [c.Name for c in descendants(item) if c.ControlTypeName == "TextControl" and c.Name]
+    # In WeChat's current tree the transcript follows duration in a private chat;
+    # a group row has the sender nickname in front of both.
+    index = 2 if mode == "group" else 1
+    return clean_voice_text(names[index]) if len(names) > index else ""
 
 
 # Where a group member's avatar and nickname sit inside a message row, in 96-dpi
@@ -265,6 +302,50 @@ class WeChatAdapter:
             return "assistant"
         return None  # Ambiguous or occluded: fail closed.
 
+    def transcribe(self, row, timeout=7.0):
+        """Use WeChat's own voice-to-text action for one confirmed-new message."""
+        item = getattr(row, "voice", None)
+        if item is None:
+            return row.text
+        text = voice_text(item, self.mode)
+        if text:
+            return f"[语音：{text}]"
+        previous = foreground()
+        try:
+            self.validate()
+            self.window.SetActive(waitTime=0.05)
+            box = item.BoundingRectangle
+            item.RightClick(x=max(5, min(120, box.width() - 5)), ratioY=0.5,
+                            simulateMove=False, waitTime=0.05)
+            option = None
+            for name in ("语音转文字", "語音轉文字", "Voice to Text"):
+                candidate = auto.MenuItemControl(Name=name, searchDepth=8)
+                if candidate.Exists(0.35):
+                    option = candidate
+                    break
+            if option is None:
+                auto.SendKeys("{Esc}", waitTime=0.05)
+                return VOICE_FAILED
+            option.Click(simulateMove=False, waitTime=0.05)
+            deadline, last, stable = time.monotonic() + timeout, "", 0
+            while time.monotonic() < deadline:
+                text = voice_text(item, self.mode)
+                if text:
+                    stable = stable + 1 if text == last else 1
+                    last = text
+                    if stable >= 2:
+                        return f"[语音：{text}]"
+                time.sleep(0.15)
+            return VOICE_FAILED
+        except Exception:
+            try:
+                auto.SendKeys("{Esc}", waitTime=0.05)
+            except Exception:
+                pass
+            return VOICE_FAILED
+        finally:
+            self.restore(previous)
+
     def read(self) -> list[Message]:
         self.validate()
         listing = self.window.ListControl(AutomationId="chat_message_list")
@@ -280,19 +361,30 @@ class WeChatAdapter:
             return cache[0]
 
         result, visible_rows = [], 0
+        # (rows read before it, text) for each system notice ("你已添加了…"): not a message, but
+        # the chat list may show one as the last line, which Runner.prime then anchors on.
+        self.system_marks = []
         for item in listing.GetChildren():
             if item.ControlTypeName != "ListItemControl":
                 continue
             if item.ClassName in SYSTEM_ITEMS:
+                if item.ClassName != "mmui::ChatItemView" and item.Name:  # ChatItemView is a time stamp
+                    self.system_marks.append((len(result), item.Name))
                 continue
-            media = item.ClassName != TEXT_ITEM and bool(
+            raw_name = (item.Name or "").strip()
+            voice = bool(VOICE_NAME.match(raw_name) or VOICE_CLASS.search(item.ClassName or ""))
+            media = item.ClassName != TEXT_ITEM and not voice and bool(
                 MEDIA_ITEM.search(item.ClassName) or MEDIA_NAME.match(item.Name or ""))
-            if item.ClassName not in CONTENT_ITEMS and not media:
+            known = item.ClassName in CONTENT_ITEMS or media or voice
+            # A new WeChat private-message class must not become silent data loss.
+            # Direction is still checked below, so system rows and our own rows stay out.
+            if not known and self.mode != "private":
                 continue
             box = item.BoundingRectangle
             if box.bottom <= rect.top or box.top >= rect.bottom:
                 continue
-            visible_rows += 1
+            if known:
+                visible_rows += 1
             # Read only rows whose avatar and bubble locations still belong to WeChat.
             y = min(rect.bottom - 2, max(rect.top + 2, box.top + round(25 * dpi)))
             if not all(visible_point(self.hwnd, x, y) for x in
@@ -308,31 +400,47 @@ class WeChatAdapter:
             role = self.role_of(item, controls, rect, grab)
             if role is None:
                 continue
+            if not known:
+                if role != "user":
+                    continue
+                visible_rows += 1
             parts = []
             for c in controls:
                 if c.ControlTypeName == "TextControl" and c.Name and c.Name not in (self.target, "已读") \
                         and c.Name not in parts:
                     parts.append(c.Name)
             text = ("\n".join(parts) or item.Name).strip()
-            if (self.mode == "group" or media or item.ClassName != TEXT_ITEM) and item.Name:
+            if (self.mode == "group" or media or voice or item.ClassName != TEXT_ITEM) and item.Name:
                 # Any extra text child next to the bubble content is the nickname.
                 text = item.Name.strip()
-            if media:
+            if voice:
+                # Always the same text: WeChat renames the row once it is transcribed, and the
+                # Runner finds its place again by row text after switching chats. The words go
+                # into her history through Runner.accept -> transcribe().
+                text = "[语音]"
+            elif media:
                 text = "[图片]" if re.match(r"^\[?(?:图片|Photo|Image)", text) else \
                     "[视频]" if re.match(r"^\[?(?:视频|Video)", text) else "[表情包]"
             if not text:
+                text = UNKNOWN_MESSAGE if not known and self.mode == "private" else ""
+            if not text:
                 continue
-            key = hashlib.sha256(json.dumps([list(item.GetRuntimeId()), role, text],
+            # The name changes when WeChat adds a transcription. Keep the message key stable.
+            key_text = "[语音]" if voice else text
+            key = hashlib.sha256(json.dumps([list(item.GetRuntimeId()), role, key_text],
                                             ensure_ascii=False).encode()).hexdigest()
             sender = ""
             if self.mode == "group" and role == "user":
                 extra = [p for p in parts if p != text and not MEDIA_NAME.match(p)]
                 sender = self.sender_of(key, item, rect, grab, dpi, extra[0] if extra else None)
             image = self.bubble(item, rect, grab, dpi, role) if media and role == "user" else None
-            result.append(Message(key, text, role, sender, image))
+            odd = not known and self.mode == "private"
+            voice_item = item if voice and role == "user" else None
+            result.append(Message(key, text, role, sender, image, voice_item, odd))
             if len(self.row_cache) > 2000:
                 self.row_cache.clear()
-            self.row_cache[ident] = Message(key, text, role, sender)  # image only matters the first time
+            self.row_cache[ident] = Message(key, text, role, sender, None, voice_item, odd)
+            # image only matters the first time; the voice row stays usable until Runner confirms it is new
         if visible_rows and not result:
             raise RuntimeError("消息区域被遮挡或收发方向无法确认，暂停这一轮")
         return result

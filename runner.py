@@ -31,6 +31,9 @@ NOTICE_CHARS = 500  # agent receipts and reports may be longer than a chat reply
 IMAGE_CACHE = []  # (fingerprint, description), shared by every chat in this process
 SMALL_EMOJI = re.compile(r"\[([^\[\]]{1,6})\]")
 SMALL_EMOJI_NAMES = frozenset(WECHAT_EMOJI)
+ODD_PRIVATE_REPLIES = ("有病？[白眼]", "你发的什么鬼？[白眼]", "？？？你干嘛")
+# Last words when a private chat must be answered and the model still gave nothing usable.
+MUST_REPLIES = ("嗯？你说", "我在呢", "然后呢？", "哈哈你继续")
 
 
 def compact(text):
@@ -102,6 +105,7 @@ class Runner:
         # Opening a topic on her own (a group bubble, a message to the owner), set by the
         # scheduler for one step: {"idle_minutes", "unanswered"}. The hooks report back to it.
         self.opening = None
+        self.resume_once = False  # the owner pressed 重新接话 for this chat
         self.opening_active = False
         self.on_heard = lambda: None
         self.on_spoke = lambda opening: None
@@ -225,10 +229,13 @@ class Runner:
 
     def own_sticker(self, image):
         """Our own pasted sticker read back as someone else's."""
-        now, mark = time.monotonic(), avatar_hash(image)
+        from stickers import trim
+        # What she sent was fingerprinted trimmed (sticker_hash); a bubble read back carries the
+        # chat background around it, so compare it trimmed too, and as read for good measure.
+        now, marks = time.monotonic(), (avatar_hash(trim(image)), avatar_hash(image))
         while self.recent_stickers and now - self.recent_stickers[0][0] > 120:
             self.recent_stickers.popleft()
-        return any(distance(mark, sent) <= 10 for _, sent in self.recent_stickers)
+        return any(distance(mark, sent) <= 10 for _, sent in self.recent_stickers for mark in marks)
 
     def describe(self, row):
         """'[表情包：…]' text for an incoming picture; the bare label if the model can't see.
@@ -264,6 +271,14 @@ class Runner:
     def accept(self, row):
         if row.role != "user" or self.own_echo(row.text):
             return False
+        if getattr(row, "voice", None) is not None:
+            try:
+                row.text = self.adapter.transcribe(row)
+            except Exception as exc:
+                row.text = "[语音：微信没能转成文字]"
+                self.status(f"语音没转出来：{str(exc)[:60]}")
+            if "没能转成文字" in row.text:
+                row.odd = True
         if self.is_owner() and getattr(row, "image", None) is None:
             handled = self.agent_command(row.text, act=not self.replaying)
             if handled:
@@ -373,11 +388,28 @@ class Runner:
             return False, "", None
         return True, text, (result["sticker"], sticker) if sticker else None
 
-    def sent(self, text, proactive):
-        """Bookkeeping for one confirmed message, saved before anything else can fail."""
+    def odd_private_reply(self):
+        """A private unknown message never disappears just because the model declined it."""
+        return self.fallback_reply(ODD_PRIVATE_REPLIES)
+
+    def fallback_reply(self, lines):
+        """One of `lines` that is not a repeat of what she just said."""
+        key = str(self.pending[-1].key) if self.pending else str(len(self.history))
+        offset = sum(ord(ch) for ch in key) % len(lines)
+        for i in range(len(lines)):
+            candidate = lines[(offset + i) % len(lines)]
+            parsed = self.parse({"speak": True, "text": candidate, "sticker": ""})
+            if parsed[0]:
+                return parsed
+        return True, "你发的啥？", None
+
+    def sent(self, text, proactive, notice=False):
+        """Bookkeeping for one confirmed message, saved before anything else can fail.
+
+        `notice`: not her own talk (a receipt, a report, words relayed for the owner, a drawing)."""
         self.last_send = time.monotonic()
         self.sent_times.append(self.last_send)
-        self.history.append({"role": "assistant", "text": text})
+        self.history.append({"role": "assistant", "text": text, **({"notice": True} if notice else {})})
         self.emit("sent", text)
         self.on_spoke(self.opening_active)  # an opening counts once, even with a sticker after it
         self.opening_active = False
@@ -423,8 +455,12 @@ class Runner:
             matches = [i for i, row in enumerate(rows) if compact(row.text) == prior
                        or (getattr(row, "sender", "") and prior in (
                            compact(row.sender + "：" + row.text), compact(row.sender + ":" + row.text)))]
+            # A new contact's chat list shows "你已添加了…" (a system notice, not a row) as its last line.
+            notices = [at for at, text in getattr(self.adapter, "system_marks", []) if compact(text) == prior]
             if matches:
                 start = matches[-1] + 1
+            elif notices:
+                start = notices[-1]
             else:
                 raise RuntimeError("找不到上次消息的位置，保留待办；请打开聊天加载完整记录后再继续")
         elif self.reply_latest and rows and rows[-1].role == "user":
@@ -470,7 +506,7 @@ class Runner:
             self.emit("error", "转告发送未确认，已暂停。请检查微信，避免重复。")
             raise
         shown = "".join(f"@{m} " for m in at) + text
-        self.sent(shown, proactive=True)
+        self.sent(shown, proactive=True, notice=True)
         self.status(f"已在「{self.chat}」说了（{why}）")
         return missing
 
@@ -490,7 +526,7 @@ class Runner:
             self.enabled.clear()
             self.emit("error", "发图未确认，已暂停。请检查微信，避免重复。")
             raise
-        self.sent(f"[图片：{label}]", proactive=True)
+        self.sent(f"[图片：{label}]", proactive=True, notice=True)
         self.status(f"已在「{self.chat}」发了图")
 
     def deliver(self):
@@ -629,14 +665,24 @@ class Runner:
             return
         proactive = not has_pending
         opening, self.opening = (self.opening if proactive else None), None
+        if proactive and self.resume_once:
+            # What the other side said last, whatever she has said since; nothing is written as
+            # if they had said it again.
+            recent = [f"{r['sender']}：{r['text']}" if r.get("sender") else r["text"]
+                      for r in self.history if r["role"] == "user"][-5:]
+            opening = {"resume": recent}
+        self.resume_once = False
+        resuming = bool(opening and "resume" in opening)
+        # The owner's rule: a private chat is always answered, and 重新接话 always says something.
+        must_reply = resuming or (self.mode == "private" and bool(self.pending))
         if proactive and not opening and not self.may_proactive(now):
             if not self.learn(now):
                 self.status(f"监听中 · {self.chat}")
             return
-        if self.muted and opening:
+        if self.muted and opening and not resuming:
             self.on_declined()
             return
-        if self.muted:
+        if self.muted and not must_reply:  # a private chat and 重新接话 outrank a hush
             self.pending.clear()
             self.proactive_used = True
             self.status("本轮保持安静 · 新消息可重新开始")
@@ -669,13 +715,14 @@ class Runner:
         if not self.allowed_to_send():
             self.status("控制发言频率中")
             return
-        self.status("想想要不要冒个泡…" if opening else "想一句自然的接话…" if proactive
+        self.status("想想怎么接上刚才的话…" if resuming else "想想要不要冒个泡…" if opening
+                    else "想一句自然的接话…" if proactive
                     else f"{self.name}正在想怎么接话…")
         epoch = self.enabled.epoch
         pending_keys = [m.key for m in self.pending]
         try:
-            result = self.brain.decide(
-                self.history, proactive, chat=self.chat, mode=self.mode, mentioned=mentioned,
+            ask = dict(
+                chat=self.chat, mode=self.mode, mentioned=mentioned,
                 continuing=continuing,
                 memory=self.memory.prompt_block(self.speakers()) if self.config["memory_enabled"] else "",
                 **({"batch": [{"text": m.text, "sender": getattr(m, "sender", "")} for m in self.pending]}
@@ -684,10 +731,22 @@ class Runner:
                     "relay_messages": [m.text for m in self.pending], "handoff": True}
                    if self.is_owner() and not opening else {}),
                 **({"opening": opening} if opening else {}))
+            result = self.brain.decide(self.history, proactive, **ask)
             speak, text, sticker = self.parse(result)
-            if speak and not proactive and not mentioned and isinstance(result, dict) \
-                    and result.get("to_me") is False:
+            odd_private = self.mode == "private" and any(getattr(m, "odd", False) for m in self.pending)
+            if odd_private and not speak:
+                speak, text, sticker = self.odd_private_reply()
+            if speak and not must_reply and not odd_private and not proactive and not mentioned \
+                    and isinstance(result, dict) and result.get("to_me") is False:
                 speak = False  # Read the room: not talking to her, so she stays out of it.
+            handoff = isinstance(result, dict) and isinstance(result.get("handoff"), dict) \
+                and result["handoff"].get("kind") in ("draw", "codex")
+            if must_reply and not speak and not handoff:
+                # Asked to stay silent, or her line was dropped (a repeat, half a sentence): ask once
+                # more, insisting; then a short line of last resort.
+                speak, text, sticker = self.parse(self.brain.decide(self.history, proactive, force=True, **ask))
+                if not speak:
+                    speak, text, sticker = self.fallback_reply(MUST_REPLIES)
         except Exception as exc:
             self.model_failed(exc)
             raise
@@ -729,14 +788,15 @@ class Runner:
             self.proactive_used = True  # Also stop repeated polling if the LLM chose silence.
         if not speak:
             self.proactive_used = True
-            self.status("这会儿没什么好说的，先不冒泡" if opening else "这轮先不接话")
-            if opening:
+            self.status("这会儿接不上话，先不说" if resuming else "这会儿没什么好说的，先不冒泡" if opening
+                        else "这轮先不接话")
+            if opening and not resuming:
                 self.on_declined()
             return
         if not self.allowed_to_send():
             self.status("控制发言频率中 · 本次草稿作废")
             return
-        self.opening_active = bool(opening)
+        self.opening_active = bool(opening) and not resuming  # only her own openings count as unanswered
         try:
             if text:
                 # Remember before sending: an uncertain send may still land in the chat.
