@@ -152,7 +152,15 @@ class Brain:
             message = value['choices'][0]['message']
             if message.get('tool_calls') or message.get('function_call'):
                 raise ValueError()
-            return json.loads(message['content'])
+            content = message.get('content') or ''
+            try:
+                return json.loads(content)
+            except ValueError:
+                # Outside JSON mode the object may come wrapped in prose or a code fence.
+                found = re.search(r'\{.*\}', content, re.S)
+                if not found:
+                    raise
+                return json.loads(found.group(0))
         except Exception:
             # Do not retain bodies/headers/errors containing a credential in chains.
             raise RuntimeError('social_request_failed') from None
@@ -167,11 +175,14 @@ class Brain:
                    'thinking': {'type': 'enabled' if thinking else 'disabled'},
                    'response_format': {'type': 'json_object'}}
         # JSON mode now and then answers with blank content: ask again before giving up.
-        for attempt in range(3):
+        # JSON mode answers blank about half the time; plain mode with the JSON instruction is
+        # far steadier, so try plain first and fall back to JSON mode.
+        plain = {k: v for k, v in payload.items() if k != 'response_format'}
+        for attempt in range(4):
             try:
-                return self.post(payload)
+                return self.post(plain if attempt < 2 else payload)
             except RuntimeError:
-                if attempt == 2:
+                if attempt == 3:
                     raise
 
     def work_intent(self, line):
