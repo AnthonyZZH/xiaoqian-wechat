@@ -1071,7 +1071,11 @@ class Bot:
             if self.settings.chat_mode(self.settings["chat"]) is None:
                 raise RuntimeError("请先在“聊天”页添加并选择一个聊天")
             self.adapter.open_chat(self.settings["chat"])
-            self.adapter.validate()
+            edit = self.adapter.validate()
+            # A send cut off by a restart can leave her own draft in the box; it would block every
+            # later read/send, so clear it before starting.
+            if self.adapter.input_value(edit).strip():
+                edit.GetValuePattern().SetValue("", waitTime=0)
             self.ensure_model()
             if not self.stop.is_set() and self.enabled.epoch == ticket:
                 rows = self.adapter.read()
