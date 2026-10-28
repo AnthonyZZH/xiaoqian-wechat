@@ -724,6 +724,7 @@ class Runner:
             # Retrieval reads ONLY this runner's local Memory, selecting <=5 entries.
             facts = self.memory.social_retrieve(' '.join(m.text for m in pending)[-2000:]) if self.config['memory_enabled'] else []
             group_digest = self.context() if self.is_owner() else ''
+            dispatched, self.work_dispatched = getattr(self, 'work_dispatched', False), False
             result = self.brain.decide(self.history, proactive, chat=self.chat, mode=self.mode, memory=facts, mentioned=mentioned, opening=opening, group_digest=group_digest, profile=self.owner_profile())
             self.proactive_used = True
             self.pending.clear()
@@ -769,7 +770,7 @@ class Runner:
                     self.sent(line,proactive)
                 if self.is_owner() and result.get('go'):
                     self.owner_go(result['go']['chat'], result['go']['text'])  # she decided to go: no approval
-                if self.is_owner() and result.get('do'):
+                if self.is_owner() and result.get('do') and not dispatched:
                     self.owner_do(result['do'])  # real work on the server, reported back when done
                 if self.mode == 'group' and pending and getattr(pending[-1], 'sender', ''):
                     self.partner = (pending[-1].sender, time.monotonic())

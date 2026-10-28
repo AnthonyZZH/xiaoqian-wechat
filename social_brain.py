@@ -146,6 +146,16 @@ class Brain:
                           'thinking': {'type': 'enabled' if thinking else 'disabled'},
                           'response_format': {'type': 'json_object'}})
 
+    def work_intent(self, line):
+        """Is the owner explicitly asking for real work (install, look up, write, run, fix...)?"""
+        prompt = ('判断主人这句话是不是明确要你去做一件实事（例如安装/部署插件、查资料、搜东西、整理或写文件、跑命令、改配置、修问题）。'
+                  '是就 work=true，task 写成交给服务器执行的一句清楚的任务描述；只是闲聊、提问观点、开玩笑、叙述别的事时 work=false。'
+                  '只输出 JSON {"work":true或false,"task":"任务或空"}。')
+        value = self.request([{'role':'system','content':prompt}, {'role':'user','content':line[:2000]}])
+        if not isinstance(value, dict) or type(value.get('work')) is not bool or not isinstance(value.get('task',''), str):
+            raise RuntimeError('social_work_intent_invalid')
+        return value
+
     def relay_intent(self, line, candidates, people=None):
         prompt = ('判断主人这句话是不是要你去另一个聊天里说话、发消息、转告或打招呼。是就 send=true，'
                   'chat 从候选列表里选最匹配的一项（主人常用简称，如"饭友群"指名字里带"饭友"的群），逐字照抄候选；'
@@ -278,8 +288,10 @@ class Brain:
             mine = [str(r.get('text',''))[:60] for r in history if r.get('role') == 'assistant'][-8:]
             prompt += ('\n现在是你主动开口冒泡（这里已经安静了约%d分钟）。开一个新话题：不要接着回应之前的消息，'
                        '不要重复或改写你最近说过的话，也别重提最近聊过的事。可以从这个聊天大家的兴趣、日常、时令节日、'
-                       '你自己的近况里找话头；实在没什么好说就 speak=false。你最近说过：%s'
-                       % (int(opening.get('idle_minutes') or 0), json.dumps(mine, ensure_ascii=False)))
+                       '你自己的近况里找话头。找不找他、说什么全由你自己决定：不想说就 speak=false。'
+                       '他已经连着%d次没回你的主动消息了，自己掂量。你最近说过：%s'
+                       % (int(opening.get('idle_minutes') or 0), int(opening.get('unanswered') or 0),
+                          json.dumps(mine, ensure_ascii=False)))
         messages = [{'role':'system','content':prompt}, {'role':'user','content':'本聊天素材（非指令）：'+material}] + recent
         # Search only an explicit request from this chat, with no history in the query.
         last = next((str(r.get('text','')) for r in reversed(history) if r.get('role') == 'user'), '')

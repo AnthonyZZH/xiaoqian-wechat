@@ -85,6 +85,9 @@ class Enabled:
         self.event.clear()
 
 
+WORK_HINT = re.compile(r'装|安装|部署|下载|更新|升级|查|搜|找|整理|写|生成|跑|运行|执行|配置|设置|修|改|删|弄|做|帮我|给我|看看|试试|plugin|插件|install', re.I)
+
+
 class Bot:
     """Owns WeChat and the runner on one worker thread; the window only sends commands."""
 
@@ -159,7 +162,8 @@ class Bot:
             r.on_heard = lambda r=r: self.initiative.heard(r.chat, r.mode)
             r.on_spoke = lambda opening, r=r: self.initiative.spoke(r.chat, r.mode, opening)
             r.on_declined = lambda r=r: self.initiative.declined(r.chat, r.mode)
-            r.owner_relay_command = lambda line, r=r: self.owner_agent_task(r, line) or self.enqueue_owner_relay(r, line)
+            r.owner_relay_command = lambda line, r=r: (self.owner_agent_task(r, line) or self.enqueue_owner_relay(r, line)
+                                                       or self.owner_work_request(r, line))
             r.owner_go = lambda chat, text, r=r: self.enqueue_self_relay(r, chat, text)
             r.owner_do = lambda task, r=r: self.start_server_task(r, task)
             r.agent_command = self.agent_command
@@ -249,7 +253,20 @@ class Bot:
         runner.notices.append(self.server_agent.start(match.group('task').strip()))
         return True
 
-    def start_server_task(self, runner, task):
+    def owner_work_request(self, runner, line):
+        """An explicit request for real work always reaches the server; she still answers normally."""
+        if not runner.is_owner() or runner.replaying or not isinstance(line, str) or not WORK_HINT.search(line):
+            return False
+        try:
+            intent = self.brain.work_intent(line)
+        except Exception:
+            return False
+        if intent['work'] and intent.get('task', '').strip():
+            runner.work_dispatched = True  # her own 'do' this turn would duplicate it
+            self.start_server_task(runner, intent['task'].strip(), announce=True)
+        return False
+
+    def start_server_task(self, runner, task, announce=False):
         """Hand work she decided on to the server agent; only the owner's chat can trigger it."""
         from server_agent import ServerAgent
         if not runner.is_owner() or runner.replaying:
@@ -258,8 +275,8 @@ class Bot:
             self.server_agent = ServerAgent(self.data / 'agent', self.settings.get('api_key_env', 'DEEPSEEK_API_KEY'),
                                             lambda text, r=runner: r.notices.append(text))
         reply = self.server_agent.start(task)
-        if '忙' in reply:
-            runner.notices.append(reply)
+        if announce or '忙' in reply:
+            runner.notices.append(reply)  # a real receipt, so nobody has to take her word for it
 
     def enqueue_self_relay(self, runner, chat, text):
         """She decided, while talking with the owner, to go and say something elsewhere."""
