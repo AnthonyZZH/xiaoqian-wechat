@@ -8,6 +8,14 @@ import threading
 import time
 from datetime import datetime, time as local_time, timedelta
 from pathlib import Path
+from social_policy import zone
+
+# 2026 State Council holiday dates; weekends are always off-peak separately.
+HOLIDAYS_2026 = frozenset(['2026-01-01','2026-01-02',
+    *[f'2026-02-{d:02d}' for d in range(15,24)], '2026-04-06',
+    *[f'2026-05-{d:02d}' for d in range(1,6)], '2026-06-19',
+    '2026-09-25', *[f'2026-10-{d:02d}' for d in range(1,8)]])
+SLEEP_WORDS = ('睡了','去睡','睡觉','晚安','困了','睡啦','睡咯','睡一会','睡会儿','上床','休息了')
 
 
 class Initiative:
@@ -19,6 +27,7 @@ class Initiative:
         self.clock = clock
         self.rng = rng or random.Random()
         self.lock = threading.RLock()
+        self.sleep_until = 0
         self.states = self._load()
 
     def _setting(self, key, default=None):
@@ -46,6 +55,7 @@ class Initiative:
     def _load(self):
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
+            self.sleep_until = max(0, self._number(raw.get('sleep_until', 0)) or 0)
             raw = raw.get("chats", {})
         except (OSError, ValueError, TypeError, AttributeError):
             return {}
@@ -67,7 +77,7 @@ class Initiative:
     def _save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = Path(f"{self.path}.tmp")
-        temp.write_text(json.dumps({"chats": self.states}, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.write_text(json.dumps({"chats": self.states, "sleep_until": self.sleep_until}, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(self.path)
 
     def _now(self, now):
@@ -100,8 +110,30 @@ class Initiative:
         value = self._number(self._setting("initiative_group_idle_minutes", 40))
         return max(0.0, value if value is not None else 40.0) * 60
 
-    def _schedule(self, mode, now, after_activity=True):
-        delay = self._delay(mode)
+    def _schedule(self, mode, now, after_activity=True, chat=None):
+        if mode == 'private' and chat == self._setting('owner'):
+            dt = datetime.fromtimestamp(now, zone('Asia/Shanghai'))
+            periods = self._setting('initiative_peak_periods', [['09:00','12:00'],['14:00','18:00']])
+            holidays = self._setting('initiative_peak_holidays', list(HOLIDAYS_2026))
+            peak = dt.weekday() < 5 and dt.date().isoformat() not in holidays
+            try:
+                minute = dt.hour * 60 + dt.minute
+                def minutes(s):
+                    h, m = map(int, s.split(':'))
+                    if not 0 <= h <= 23 or not 0 <= m <= 59: raise ValueError()
+                    return h * 60 + m
+                peak = peak and any(minutes(start) <= minute < minutes(end) for start, end in periods)
+            except (TypeError, ValueError, AttributeError):
+                peak = True
+            key, default = ('initiative_peak_minutes', [15,30]) if peak else ('initiative_offpeak_minutes', [5,5])
+            try:
+                value = self._setting(key, default); low, high = self._number(value[0]), self._number(value[1])
+                if low is None or high is None or low < 0 or high < low: raise ValueError()
+            except (TypeError, ValueError, IndexError):
+                low, high = default
+            delay = self.rng.uniform(low, high) * 60
+        else:
+            delay = self._delay(mode)
         if mode == "group" and after_activity:
             delay += self._group_idle()
         return now + delay
@@ -118,7 +150,7 @@ class Initiative:
         self.states[chat] = {
             "mode": mode,
             "last_activity": now,
-            "next_at": self._schedule(mode, now),
+            "next_at": self._schedule(mode, now, chat=chat),
             "unanswered": count,
         }
         self._save()
@@ -127,6 +159,16 @@ class Initiative:
         """Record somebody else's message and clear the unanswered count."""
         with self.lock:
             self._record_activity(chat, mode, self._now(now), unanswered=0)
+
+    def owner_message(self, text, now=None):
+        with self.lock:
+            moment = self._now(now)
+            self.sleep_until = moment + 5 * 3600 if any(word in str(text) for word in SLEEP_WORDS) else 0
+            self._save()
+
+    def owner_asleep(self, now=None):
+        with self.lock:
+            return self._now(now) < self.sleep_until
 
     def spoke(self, chat, mode, opening, now=None):
         """Record her own message; proactive openings increase unanswered."""
@@ -143,7 +185,7 @@ class Initiative:
             if not current or current.get("mode") != mode:
                 self._record_activity(chat, mode, moment, unanswered=0)
                 return
-            current["next_at"] = self._schedule(mode, moment, after_activity=False)
+            current["next_at"] = self._schedule(mode, moment, after_activity=False, chat=chat)
             self._save()
 
     def _eligible(self, chat, mode):
@@ -197,10 +239,12 @@ class Initiative:
                     self.states[chat] = state = {
                         "mode": mode,
                         "last_activity": moment,
-                        "next_at": self._schedule(mode, moment),
+                        "next_at": self._schedule(mode, moment, chat=chat),
                         "unanswered": 0,
                     }
                     changed = True
+                    continue
+                if mode == 'private' and chat == self._setting('owner') and moment < self.sleep_until:
                     continue
                 if state["unanswered"] >= self._maximum(mode):
                     continue

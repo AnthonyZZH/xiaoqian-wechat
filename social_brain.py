@@ -69,6 +69,27 @@ class Brain:
     def persona(self):
         return self.personas.load(self.settings['persona'])
 
+    def opening_prompt(self, history, opening, now=None):
+        from social_policy import zone
+        moment = datetime.fromtimestamp(time.time() if now is None else now, zone('Asia/Shanghai'))
+        recent = [{'role':r.get('role',''), 'text':str(r.get('text',''))[:300]}
+                  for r in history[-10:] if isinstance(r,dict)]
+        mine = [str(r.get('text',''))[:300] for r in history if isinstance(r,dict) and r.get('role') == 'assistant'][-3:]
+        content = {'time':moment.strftime('%Y-%m-%d %H:%M'), 'idle_minutes':int(opening.get('idle_minutes') or 0),
+                   'unanswered':int(opening.get('unanswered') or 0), 'recent':recent, 'my_last_three':mine}
+        return (self.persona().prompt[:1500] + '\n现在要不要主动找主人？根据以下聊天情况自己决定，'
+                '只输出 JSON {"speak":true或false}。\n' + json.dumps(content, ensure_ascii=False))
+
+    def opening_check(self, history, opening):
+        try:
+            prompt = self.opening_prompt(history, opening)
+            value = self.post({'model':self.settings.get('model', {}).get('identifier', 'deepseek-chat'),
+                'messages':[{'role':'system','content':prompt}], 'temperature':0.3, 'max_tokens':32,
+                'stream':False, 'thinking':{'type':'disabled'}, 'response_format':{'type':'json_object'}})
+            return isinstance(value,dict) and type(value.get('speak')) is bool and value['speak']
+        except Exception:
+            return False
+
     def relay_text(self, instruction):
         # Only the owner's request is supplied; no other chat history or tools.
         prompt = self.persona().prompt[:12000] + (

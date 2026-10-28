@@ -160,6 +160,8 @@ class Bot:
                        memory_dir=self.data/'memory', outbound_mode=outbound_mode)
             r.should_yield = lambda r=r: self.higher_priority(r)
             r.on_heard = lambda r=r: self.initiative.heard(r.chat, r.mode)
+            r.on_owner_message = lambda text: self.initiative.owner_message(text)
+            r.owner_asleep = lambda: self.initiative.owner_asleep()
             r.on_spoke = lambda opening, r=r: self.initiative.spoke(r.chat, r.mode, opening)
             r.on_declined = lambda r=r: self.initiative.declined(r.chat, r.mode)
             r.owner_relay_command = lambda line, r=r: (self.owner_agent_task(r, line) or self.enqueue_owner_relay(r, line)

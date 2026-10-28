@@ -109,6 +109,8 @@ class Runner:
         self.insist = False  # 重新接话 took in missed lines: answer them whatever the model thinks
         self.opening_active = False
         self.on_heard = lambda: None
+        self.on_owner_message = lambda text: None
+        self.owner_asleep = lambda: False
         self.on_spoke = lambda opening: None
         self.on_declined = lambda: None
         # The owner asked for real work (a drawing, a Codex task): (kind, task) -> receipt or None.
@@ -263,6 +265,8 @@ class Runner:
     def accept(self, row):
         if row.role != "user" or self.own_echo(row.text):
             return False
+        if self.is_owner() and not self.replaying and getattr(row, 'voice', None) is None:
+            self.on_owner_message(row.text)
         if self.is_owner() and not self.replaying and getattr(row, 'image', None) is None and getattr(row, 'voice', None) is None and self.owner_relay_command(row.text):
             self.history.append({"role": "user", "text": row.text})
             self.emit("received", row.text)
@@ -275,6 +279,8 @@ class Runner:
                 self.status(f"语音没转出来：{str(exc)[:60]}")
             if "没能转成文字" in row.text:
                 row.odd = True
+            if self.is_owner() and not self.replaying:
+                self.on_owner_message(row.text)
         if self.is_owner() and getattr(row, "image", None) is None:
             handled = self.agent_command(row.text, act=not self.replaying)
             if handled:
@@ -617,7 +623,7 @@ class Runner:
 
     def may_proactive(self, now):
         # Unprompted follow-ups go to the owner only; friends are never messaged out of the blue.
-        return (self.mode == "private" and self.is_owner() and self.config["proactive"] and not self.proactive_used
+        return (self.mode == "private" and self.is_owner() and not self.owner_asleep() and self.config["proactive"] and not self.proactive_used
                 and not self.muted and not self.quiet() and now >= self.next_proactive
                 and now - self.last_incoming <= self.config["proactive_window_seconds"])
 
@@ -679,9 +685,9 @@ class Runner:
                 self.save()
             if not self.pending and any(r.get('role') == 'user' for r in self.history):
                 self.opening = {'resume': True}
-        if self.is_owner():
+        if self.is_owner() and not self.owner_asleep():
             self.queue_balance_alert()
-        if self.notices and self.is_owner():
+        if self.notices and self.is_owner() and not self.owner_asleep():
             notice = self.notices.popleft()  # never retry an uncertain send
             epoch = self.enabled.epoch
             cancel = lambda: self.stop.is_set() or not self.enabled.is_set() or self.enabled.epoch != epoch
@@ -706,6 +712,8 @@ class Runner:
         opening, self.opening = self.opening, None
         mandatory = bool(pending) and (self.mode == 'private' or mentioned)
         proactive = not mandatory
+        if proactive and self.is_owner() and self.owner_asleep():
+            return
         if self.muted and not mandatory:
             return
         if not pending and not opening and not self.may_proactive(now):
@@ -721,6 +729,11 @@ class Runner:
         def cancel():
             return self.stop.is_set() or not self.enabled.is_set() or self.enabled.epoch != epoch
         try:
+            if opening and not mandatory and self.is_owner() and not opening.get('resume'):
+                if not self.brain.opening_check(self.history, opening):
+                    self.on_declined()
+                    return
+                self.opening_active = True
             # Retrieval reads ONLY this runner's local Memory, selecting <=5 entries.
             facts = self.memory.social_retrieve(' '.join(m.text for m in pending)[-2000:]) if self.config['memory_enabled'] else []
             group_digest = self.context() if self.is_owner() else ''
@@ -729,6 +742,9 @@ class Runner:
             self.proactive_used = True
             self.pending.clear()
             if not isinstance(result,dict) or not result.get('speak') or unsafe(result.get('text','')):
+                if self.opening_active:
+                    self.opening_active = False
+                    self.on_declined()
                 return
             if self.mode == 'group' and pending and not mentioned and result.get('to_me') is False:
                 return
@@ -784,3 +800,7 @@ class Runner:
             self.model_failed(None)
             # Uncertain UI sends must not be retried. Owner can inspect then resume.
             self.enabled.clear()
+        finally:
+            if self.opening_active:
+                self.opening_active = False
+                self.on_declined()
