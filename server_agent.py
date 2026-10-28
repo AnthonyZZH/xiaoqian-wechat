@@ -15,7 +15,7 @@ from pathlib import Path
 DSH_BIN = Path(r'C:\xiaoqian\app\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js')
 NODE = Path(r'C:\Program Files\nodejs\node.exe')
 PREFIX = re.compile(r'^\s*(?:给本机|给服务器|给deepseek|给ds|让本机|让ds|任务)\s*[:：,，]?\s*(?P<task>\S.*)$', re.I | re.S)
-TIMEOUT = 15 * 60
+TIMEOUT = None  # the owner wants no time limit: a task runs until DSH finishes it
 
 
 def answer(output):
