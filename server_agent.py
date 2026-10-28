@@ -42,11 +42,8 @@ class ServerAgent:
         self.busy = None
 
     def start(self, task):
-        with self.lock:
-            if self.busy:
-                return '本机还在忙上一件事，做完再接新的哦'
-            self.busy = uuid.uuid4().hex[:8]
-            job = self.busy
+        # Any number of tasks at once: each runs in its own thread with its own log.
+        job = uuid.uuid4().hex[:8]
         threading.Thread(target=self.run, args=(job, task), daemon=True).start()
         return '收到，交给本机去做了，做完告诉你'
 
@@ -76,6 +73,3 @@ class ServerAgent:
             self.report('本机这件事超过15分钟还没做完，先停下了')
         except Exception:
             self.report('本机这件事没能启动')
-        finally:
-            with self.lock:
-                self.busy = None
