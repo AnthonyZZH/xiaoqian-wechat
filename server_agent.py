@@ -35,19 +35,39 @@ def answer(output):
     return ' '.join(part for part in keep if part)
 
 
+def valid_file(raw, work):
+    try:
+        path = Path(raw)
+        if not path.is_absolute():
+            return None
+        root = Path(work).resolve(strict=True)
+        path = path.resolve(strict=True)
+        if not path.is_relative_to(root) or not path.is_file():
+            return None
+        return path
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def output_file(output, work):
+    """Accept only a final FILE line naming an existing file inside the work tree."""
+    lines = output.rstrip().splitlines()
+    return valid_file(lines[-1][5:].strip(), work) if lines and lines[-1].startswith('FILE:') else None
+
+
 class ServerAgent:
     def __init__(self, root, key_env, report):
         self.root, self.key_env, self.report = Path(root), key_env, report
         self.lock = threading.Lock()
         self.busy = None
 
-    def start(self, task):
+    def start(self, task, depth=1):
         # Any number of tasks at once: each runs in its own thread with its own log.
         job = uuid.uuid4().hex[:8]
-        threading.Thread(target=self.run, args=(job, task), daemon=True).start()
+        threading.Thread(target=self.run, args=(job, task, depth), daemon=True).start()
         return '收到，交给本机去做了，做完告诉你'
 
-    def run(self, job, task):
+    def run(self, job, task, depth=1):
         work, logs = self.root / 'work', self.root / 'logs'
         work.mkdir(parents=True, exist_ok=True)
         logs.mkdir(parents=True, exist_ok=True)
@@ -57,6 +77,10 @@ class ServerAgent:
         instructions = (r'你在一台 Windows 服务器上，有完整权限。需要插件时可执行 '
                         r'C:\xiaoqian\app\dsh\node_modules\.bin\dsh.cmd plugin --profile headless add <包名>'
                         r' 安装，DSH_HOME=C:\xiaoqian\data\agent\dsh-home，装完下一次任务生效。'
+                        r'完成任务缺少能力时自己想办法：可以安装 dsh 插件、pip/npm 包或写脚本；装好后继续把任务做完。'
+                        r'截图可用 Python PIL.ImageGrab 截当前桌面（你运行在有桌面的会话里）。不要声称做了没做的事。'
+                        r'需要交给主人看的文件（截图、图片或文档）保存到 C:\xiaoqian\data\agent\work\out\ 下，'
+                        r'最终回答最后单独一行输出 FILE: <绝对路径>。'
                         '\n\n')
         started = time.monotonic()
         try:
@@ -64,12 +88,17 @@ class ServerAgent:
                                   capture_output=True, text=True, encoding='utf-8', errors='replace',
                                   timeout=TIMEOUT, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             (logs / f'{job}.log').write_text(done.stdout + '\n' + done.stderr, encoding='utf-8')
-            text = answer(done.stdout) or answer(done.stderr)
-            result = (text[:300] + '…') if len(text) > 300 else text
-            minutes = max(1, round((time.monotonic() - started) / 60))
-            self.report(f'本机做完了（{minutes}分钟）：{result}' if done.returncode == 0 and result
-                        else '本机这件事没做成，日志在服务器 data/agent/logs/' + job + '.log')
+            file = output_file(done.stdout, work) if done.returncode == 0 else None
+            stdout = done.stdout.rstrip()
+            file_declared = bool(stdout.splitlines() and stdout.splitlines()[-1].startswith('FILE:'))
+            if file_declared:
+                stdout = '\n'.join(stdout.splitlines()[:-1])
+            text = answer(stdout)
+            success = done.returncode == 0 and bool(text or file) and not (file_declared and not file)
+            failure = '本机声明的文件不存在或不在允许的工作目录内。' if file_declared and not file else '本机任务没有成功完成。'
+            self.report({'task':task[:1000], 'result':text[:1800] if success else (failure + text[:1600]),
+                         'file':str(file) if file else '', 'success':success, 'depth':depth})
         except subprocess.TimeoutExpired:
-            self.report('本机这件事超过15分钟还没做完，先停下了')
+            self.report({'task':task[:1000], 'result':'本机任务超时，没有完成。', 'file':'', 'success':False, 'depth':depth})
         except Exception:
-            self.report('本机这件事没能启动')
+            self.report({'task':task[:1000], 'result':'本机任务启动或执行失败。', 'file':'', 'success':False, 'depth':depth})

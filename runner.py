@@ -102,6 +102,9 @@ class Runner:
         # The owner's low-risk commands inside a group ("@小千 拉黑 X"), same contract.
         self.group_command = lambda text, act=True, sender="": None
         self.notices = deque()
+        self.tool_results = deque()
+        self.tool_result_active = None
+        self.server_work_dir = DATA.parent / 'agent' / 'work'
         # Opening a topic on her own (a group bubble, a message to the owner), set by the
         # scheduler for one step: {"idle_minutes", "unanswered"}. The hooks report back to it.
         self.opening = None
@@ -701,6 +704,20 @@ class Runner:
                 self.enabled.clear()
                 self.emit('error', 'SOCIAL_OWNER_NOTICE_FAILED')
             return
+        if self.is_owner() and not self.owner_asleep() and not self.pending and not self.tool_result_active and self.tool_results:
+            from server_agent import valid_file
+            event = self.tool_results.popleft()
+            file = valid_file(event.get('file', ''), self.server_work_dir) if event.get('file') else None
+            if event.get('file') and not file:
+                event = dict(event, success=False, result='本机生成的文件已不存在或不在允许的工作目录内。')
+            event = dict(event, file=str(file) if file else '')
+            status = '完成' if event.get('success') else '失败'
+            text = '[本机任务%s] 任务：%s\n结果：%s' % (status, str(event.get('task',''))[:1000], str(event.get('result',''))[:1800])
+            if file:
+                text += '\n文件：' + file.name
+            self.history.append({'role':'user', 'sender':'本机', 'text':text, 'tool_result':True})
+            self.save()
+            self.tool_result_active = event
         now = time.monotonic()
         if self.expired(now) or now < self.retry_after or self.should_yield():
             return
@@ -710,7 +727,10 @@ class Runner:
         names = [self.name]+list(self.config.get('aliases', []))
         mentioned = any(mentions(m.text,n) for m in pending for n in names if n)
         opening, self.opening = self.opening, None
-        mandatory = bool(pending) and (self.mode == 'private' or mentioned)
+        tool_event = self.tool_result_active if self.is_owner() and not self.owner_asleep() and not pending else None
+        if tool_event:
+            opening = {'tool_result':True}
+        mandatory = bool(tool_event) or (bool(pending) and (self.mode == 'private' or mentioned))
         proactive = not mandatory
         if proactive and self.is_owner() and self.owner_asleep():
             return
@@ -739,13 +759,15 @@ class Runner:
             group_digest = self.context() if self.is_owner() else ''
             dispatched, self.work_dispatched = getattr(self, 'work_dispatched', False), False
             try:
-                result = self.brain.decide(self.history, proactive, chat=self.chat, mode=self.mode, memory=facts, mentioned=mentioned, opening=opening, group_digest=group_digest, profile=self.owner_profile())
+                result = self.brain.decide(self.history, proactive, chat=self.chat, mode=self.mode, memory=facts, mentioned=mentioned, opening=opening, group_digest=group_digest, profile=self.owner_profile(), work_pending=dispatched)
             except Exception as exc:
                 # Nothing was sent: skip this round and try again shortly instead of pausing everything.
                 self.model_failed(exc)
                 return
             self.proactive_used = True
             self.pending.clear()
+            if tool_event and (not isinstance(result,dict) or not result.get('speak') or unsafe(result.get('text','')) or not result.get('text','').strip()):
+                result = {'speak':True, 'text':'本机任务结束了，我看到了结果。' if tool_event.get('success') else '本机任务没有完成，我看到了失败结果。', 'sticker':''}
             if not isinstance(result,dict) or not result.get('speak') or unsafe(result.get('text','')):
                 if self.opening_active:
                     self.opening_active = False
@@ -768,6 +790,17 @@ class Runner:
                 # Judge each bubble on its own: drop only the lines she already said.
                 text = '\n'.join(l for l in text.split('\n')
                                  if l.strip() and not any(repeats(old, compact(l)) for old in recent))
+            if tool_event and not text:
+                text = '本机任务完成了。' if tool_event.get('success') else '本机任务没有完成。'
+            attachment = None
+            if tool_event and tool_event.get('file'):
+                from server_agent import valid_file
+                attachment = valid_file(tool_event['file'], self.server_work_dir)
+                if attachment and attachment.suffix.lower() not in ('.png','.jpg','.jpeg','.gif','.webp'):
+                    text += '\n文件：' + attachment.name
+                    attachment = None
+            if tool_event and result.get('do') and int(tool_event.get('depth',1)) >= 6:
+                text += '\n本机连续尝试了六步，还没解决；请看上一步结果，我们再决定怎么处理。'
             # Stickers are her own call: no repeat or rate rules in code.
             if not text and not path:
                 return
@@ -778,6 +811,8 @@ class Runner:
             # for the owner's private chat (the opening schedule still paces her).
             if not budget.reserve(self.chat, proactive and not self.is_owner()):
                 return
+            if tool_event:
+                self.tool_result_active = None  # uncertain sends are never retried
             # One worker owns adapter activation. Do not accept a destination from Brain.
             if text:
                 # Several bubbles, one at a time, with a typing-like pause between them.
@@ -791,8 +826,6 @@ class Runner:
                     self.sent(line,proactive)
                 if self.is_owner() and result.get('go'):
                     self.owner_go(result['go']['chat'], result['go']['text'])  # she decided to go: no approval
-                if self.is_owner() and result.get('do') and not dispatched:
-                    self.owner_do(result['do'])  # real work on the server, reported back when done
                 if self.mode == 'group' and pending and getattr(pending[-1], 'sender', ''):
                     self.partner = (pending[-1].sender, time.monotonic())
             if path:
@@ -801,6 +834,20 @@ class Runner:
                     raise RuntimeError('social_sticker_changed')
                 self.adapter.send_image(checked,cancel=cancel)
                 self.sent(self.sticker_label(sid),proactive)
+            if attachment:
+                from server_agent import valid_file
+                if valid_file(str(attachment), self.server_work_dir) == attachment:
+                    title, private = self.adapter.current()
+                    if title != self.chat or not private: raise RuntimeError('social_owner_attachment_target_invalid')
+                    self.adapter.validate()
+                    self.adapter.send_image(attachment, cancel=cancel)
+            if text and self.is_owner() and result.get('do') and not dispatched:
+                depth = int(tool_event.get('depth',1)) if tool_event else 0
+                if depth < 6:
+                    if tool_event:
+                        self.owner_do(result['do'], depth + 1)
+                    else:
+                        self.owner_do(result['do'])
         except Exception:
             self.model_failed(None)
             # Uncertain UI sends must not be retried. Owner can inspect then resume.

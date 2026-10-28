@@ -85,7 +85,7 @@ class Enabled:
         self.event.clear()
 
 
-WORK_HINT = re.compile(r'装|安装|部署|下载|更新|升级|查|搜|找|整理|写|生成|跑|运行|执行|配置|设置|修|改|删|弄|做|帮我|给我|看看|试试|plugin|插件|install', re.I)
+WORK_HINT = re.compile(r'装|安装|部署|下载|更新|升级|查|搜|找|整理|写|生成|截图|截屏|跑|运行|执行|配置|设置|修|改|删|弄|做|帮我|给我|看看|试试|什么|哪些|有没有|能不能|服务器|文件|plugin|插件|install', re.I)
 
 
 class Bot:
@@ -162,12 +162,13 @@ class Bot:
             r.on_heard = lambda r=r: self.initiative.heard(r.chat, r.mode)
             r.on_owner_message = lambda text: self.initiative.owner_message(text)
             r.owner_asleep = lambda: self.initiative.owner_asleep()
+            r.server_work_dir = self.data.parent / 'agent' / 'work'
             r.on_spoke = lambda opening, r=r: self.initiative.spoke(r.chat, r.mode, opening)
             r.on_declined = lambda r=r: self.initiative.declined(r.chat, r.mode)
             r.owner_relay_command = lambda line, r=r: (self.owner_agent_task(r, line) or self.enqueue_owner_relay(r, line)
                                                        or self.owner_work_request(r, line))
             r.owner_go = lambda chat, text, r=r: self.enqueue_self_relay(r, chat, text)
-            r.owner_do = lambda task, r=r: self.start_server_task(r, task)
+            r.owner_do = lambda task, depth=1, r=r: self.start_server_task(r, task, depth=depth)
             r.agent_command = self.agent_command
             r.context = lambda r=r: self.owner_group_digest() if r.is_owner() else ''
             self.runners[chat] = r
@@ -249,10 +250,7 @@ class Bot:
         match = PREFIX.match(line)
         if not match:
             return False
-        if getattr(self, 'server_agent', None) is None:
-            self.server_agent = ServerAgent(self.data / 'agent', self.settings.get('api_key_env', 'DEEPSEEK_API_KEY'),
-                                            lambda text, r=runner: r.notices.append(text))
-        runner.notices.append(self.server_agent.start(match.group('task').strip()))
+        self.start_server_task(runner, match.group('task').strip(), announce=True)
         return True
 
     def owner_work_request(self, runner, line):
@@ -268,15 +266,15 @@ class Bot:
             self.start_server_task(runner, intent['task'].strip(), announce=True)
         return False
 
-    def start_server_task(self, runner, task, announce=False):
+    def start_server_task(self, runner, task, announce=False, depth=1):
         """Hand work she decided on to the server agent; only the owner's chat can trigger it."""
         from server_agent import ServerAgent
         if not runner.is_owner() or runner.replaying:
             return
         if getattr(self, 'server_agent', None) is None:
-            self.server_agent = ServerAgent(self.data / 'agent', self.settings.get('api_key_env', 'DEEPSEEK_API_KEY'),
-                                            lambda text, r=runner: r.notices.append(text))
-        reply = self.server_agent.start(task)
+            self.server_agent = ServerAgent(self.data.parent / 'agent', self.settings.get('api_key_env', 'DEEPSEEK_API_KEY'),
+                                            lambda result, r=runner: r.tool_results.append(result))
+        reply = self.server_agent.start(task) if depth == 1 else self.server_agent.start(task, depth=depth)
         if announce or '忙' in reply:
             runner.notices.append(reply)  # a real receipt, so nobody has to take her word for it
 
@@ -424,6 +422,15 @@ class Bot:
         # Agent reports: in the owner's chat step() sends them; with multi-chat go
         # there; a single-chat bot elsewhere keeps them until the owner's chat is back.
         owner_runner = self.runners.get(owner)
+        if owner_runner and (getattr(owner_runner, 'tool_results', None) or getattr(owner_runner, 'tool_result_active', None)) and not owner_runner.owner_asleep():
+            if current == owner:
+                return
+            if self.settings['multi_chat'] and (chat is None or priority(chat) > 0):
+                try:
+                    self.go(owner)
+                except Exception:
+                    self.emit('error', 'SOCIAL_TOOL_RESULT_ROUTE_FAILED')
+                return
         if current != owner and owner_runner and owner_runner.notices:
             self.reports[0:0] = list(owner_runner.notices)
             owner_runner.notices.clear()
