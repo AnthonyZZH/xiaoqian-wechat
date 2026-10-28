@@ -91,6 +91,8 @@ class Runner:
         self.relay = None
         self.relay_queue = deque()
         self.owner_relay_command = lambda text: False
+        self.owner_go = lambda chat, text: None
+        self.owner_do = lambda task: None
         self.should_yield = lambda: False
         # Owner commands for local agents, wired up by the scheduler: (text, act) ->
         # None when it is ordinary chat, else {"log": text without the passphrase,
@@ -633,7 +635,7 @@ class Runner:
                 title, private = self.adapter.current()
                 if title != self.chat or not private: raise RuntimeError('social_owner_notice_target_invalid')
                 self.adapter.validate()
-                self.adapter.send(notice, cancel=cancel)
+                self.adapter.send(' '.join(str(notice).split()), cancel=cancel, max_chars=400)
             except Exception:
                 self.enabled.clear()
                 self.emit('error', 'SOCIAL_OWNER_NOTICE_FAILED')
@@ -685,10 +687,11 @@ class Runner:
                 if min(len(old), len(new)) < 10:
                     return old == new
                 return difflib.SequenceMatcher(None, new, old).ratio() >= 0.6
-            if text and any(repeats(old) for old in recent):
-                text = ''
-            if path and self.sticker_label(sid) in {r.get('text') for r in self.history[-6:]}:
-                path = None
+            if text:
+                # Judge each bubble on its own: drop only the lines she already said.
+                text = '\n'.join(l for l in text.split('\n')
+                                 if l.strip() and not any(repeats(old, compact(l)) for old in recent))
+            # Stickers are her own call: no repeat or rate rules in code.
             if not text and not path:
                 return
             if cancel() or self.ingest(self.adapter.read()) or self.should_yield():
@@ -700,9 +703,19 @@ class Runner:
                 return
             # One worker owns adapter activation. Do not accept a destination from Brain.
             if text:
-                self.recent_sends.append((time.monotonic(),compact(text)))
-                self.adapter.send(text,cancel=cancel)
-                self.sent(text,proactive)
+                # Several bubbles, one at a time, with a typing-like pause between them.
+                for n, line in enumerate(l for l in text.split('\n') if l.strip()):
+                    if n:
+                        time.sleep(min(3.0, 0.8 + 0.08 * len(line)))
+                        if cancel():
+                            return
+                    self.recent_sends.append((time.monotonic(),compact(line)))
+                    self.adapter.send(line,cancel=cancel)
+                    self.sent(line,proactive)
+                if self.is_owner() and result.get('go'):
+                    self.owner_go(result['go']['chat'], result['go']['text'])  # she decided to go: no approval
+                if self.is_owner() and result.get('do'):
+                    self.owner_do(result['do'])  # real work on the server, reported back when done
                 if self.mode == 'group' and pending and getattr(pending[-1], 'sender', ''):
                     self.partner = (pending[-1].sender, time.monotonic())
             if path:

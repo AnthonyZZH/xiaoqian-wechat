@@ -159,7 +159,9 @@ class Bot:
             r.on_heard = lambda r=r: self.initiative.heard(r.chat, r.mode)
             r.on_spoke = lambda opening, r=r: self.initiative.spoke(r.chat, r.mode, opening)
             r.on_declined = lambda r=r: self.initiative.declined(r.chat, r.mode)
-            r.owner_relay_command = lambda line, r=r: self.enqueue_owner_relay(r, line)
+            r.owner_relay_command = lambda line, r=r: self.owner_agent_task(r, line) or self.enqueue_owner_relay(r, line)
+            r.owner_go = lambda chat, text, r=r: self.enqueue_self_relay(r, chat, text)
+            r.owner_do = lambda task, r=r: self.start_server_task(r, task)
             r.agent_command = self.agent_command
             r.context = lambda r=r: self.owner_group_digest() if r.is_owner() else ''
             self.runners[chat] = r
@@ -233,6 +235,41 @@ class Bot:
     def send_relay(self, chat, text, why="主人让我说的", limit=None, at=()):
         return None
 
+    def owner_agent_task(self, runner, line):
+        """'给本机：…' from the owner's private chat runs on the server's DeepSeek Harness."""
+        from server_agent import PREFIX, ServerAgent
+        if not runner.is_owner() or runner.replaying or not isinstance(line, str):
+            return False
+        match = PREFIX.match(line)
+        if not match:
+            return False
+        if getattr(self, 'server_agent', None) is None:
+            self.server_agent = ServerAgent(self.data / 'agent', self.settings.get('api_key_env', 'DEEPSEEK_API_KEY'),
+                                            lambda text, r=runner: r.notices.append(text))
+        runner.notices.append(self.server_agent.start(match.group('task').strip()))
+        return True
+
+    def start_server_task(self, runner, task):
+        """Hand work she decided on to the server agent; only the owner's chat can trigger it."""
+        from server_agent import ServerAgent
+        if not runner.is_owner() or runner.replaying:
+            return
+        if getattr(self, 'server_agent', None) is None:
+            self.server_agent = ServerAgent(self.data / 'agent', self.settings.get('api_key_env', 'DEEPSEEK_API_KEY'),
+                                            lambda text, r=runner: r.notices.append(text))
+        reply = self.server_agent.start(task)
+        if '忙' in reply:
+            runner.notices.append(reply)
+
+    def enqueue_self_relay(self, runner, chat, text):
+        """She decided, while talking with the owner, to go and say something elsewhere."""
+        from owner_relay import resolve, guess
+        owner = self.settings.get('owner', '')
+        choices = [c for c, info in self.settings['chats'].items() if isinstance(info, dict) and c != owner]
+        target = chat if resolve(chat, self.settings['chats'], owner) else guess(chat, choices)
+        if runner.is_owner() and target:
+            self.owner_relay_requests.append((runner, (target, '', '', '', ' '.join(text.split())[:100])))
+
     def enqueue_owner_relay(self, runner, line):
         from owner_relay import RELAY_HINT, resolve, guess, people_directory
         if not runner.is_owner() or runner.replaying or not isinstance(line, str) or not RELAY_HINT.search(line):
@@ -267,6 +304,7 @@ class Bot:
         runner, (asked, instruction, *rest) = self.owner_relay_requests.popleft()
         at = rest[0] if rest else ''
         hint = rest[1] if len(rest) > 1 else ''
+        prepared = rest[2] if len(rest) > 2 else ''
         owner = self.settings.get('owner', '')
         epoch = self.enabled.epoch
         cancel = lambda: self.stop.is_set() or not self.enabled.is_set() or self.enabled.epoch != epoch
@@ -304,7 +342,7 @@ class Bot:
                 receipt = '这次不能使用艾特，没发出去。'
             else:
                 try:
-                    text = self.brain.relay_text(instruction + (f'\n（在群里对{at}说，系统会自动@他，正文不用再写@）' if at else ''))
+                    text = prepared or self.brain.relay_text(instruction + (f'\n（在群里对{at}说，系统会自动@他，正文不用再写@）' if at else ''))
                 except Exception:
                     text = None  # nothing was sent yet: tell the owner instead of pausing
                 if not valid_text(text):
