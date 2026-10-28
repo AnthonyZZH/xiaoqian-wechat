@@ -162,10 +162,17 @@ class Brain:
         thinking = self.settings.get('thinking', False)
         if type(thinking) is not bool:
             raise ValueError('social_thinking_setting_invalid')
-        return self.post({'model': model, 'messages': messages, 'temperature': 0.3 if summary else 0.8,
-                          'max_tokens': 400 if summary else 600, 'stream': False,
-                          'thinking': {'type': 'enabled' if thinking else 'disabled'},
-                          'response_format': {'type': 'json_object'}})
+        payload = {'model': model, 'messages': messages, 'temperature': 0.3 if summary else 0.8,
+                   'max_tokens': 400 if summary else 600, 'stream': False,
+                   'thinking': {'type': 'enabled' if thinking else 'disabled'},
+                   'response_format': {'type': 'json_object'}}
+        # JSON mode now and then answers with blank content: ask again before giving up.
+        for attempt in range(3):
+            try:
+                return self.post(payload)
+            except RuntimeError:
+                if attempt == 2:
+                    raise
 
     def work_intent(self, line):
         """Is the owner explicitly asking for real work (install, look up, write, run, fix...)?"""
