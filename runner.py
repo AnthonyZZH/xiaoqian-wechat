@@ -587,7 +587,8 @@ class Runner:
         return True
 
     def may_proactive(self, now):
-        return (self.mode == "private" and self.config["proactive"] and not self.proactive_used
+        # Unprompted follow-ups go to the owner only; friends are never messaged out of the blue.
+        return (self.mode == "private" and self.is_owner() and self.config["proactive"] and not self.proactive_used
                 and not self.muted and not self.quiet() and now >= self.next_proactive
                 and now - self.last_incoming <= self.config["proactive_window_seconds"])
 
@@ -677,6 +678,17 @@ class Runner:
             sid = result.get('sticker','')
             # Catalog resolution never accepts a model path. Resolve again at send time.
             path = self.stickers.path(sid) if self.stickers and sid else None
+            # Never say the same thing twice: a near-copy of a recent line, or the same sticker
+            # again so soon, reads as a bot (and an opening must not rerun the last exchange).
+            recent = [compact(r.get('text', '')) for r in self.history[-12:] if r.get('role') == 'assistant']
+            def repeats(old, new=compact(text)):
+                if min(len(old), len(new)) < 10:
+                    return old == new
+                return difflib.SequenceMatcher(None, new, old).ratio() >= 0.6
+            if text and any(repeats(old) for old in recent):
+                text = ''
+            if path and self.sticker_label(sid) in {r.get('text') for r in self.history[-6:]}:
+                path = None
             if not text and not path:
                 return
             if cancel() or self.ingest(self.adapter.read()) or self.should_yield():
