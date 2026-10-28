@@ -163,7 +163,7 @@ class Brain:
         if type(thinking) is not bool:
             raise ValueError('social_thinking_setting_invalid')
         payload = {'model': model, 'messages': messages, 'temperature': 0.3 if summary else 0.8,
-                   'max_tokens': 400 if summary else 600, 'stream': False,
+                   'stream': False,  # no output cap: the model's own limit is the only one
                    'thinking': {'type': 'enabled' if thinking else 'disabled'},
                    'response_format': {'type': 'json_object'}}
         # JSON mode now and then answers with blank content: ask again before giving up.
@@ -256,7 +256,11 @@ class Brain:
             if not count:
                 state['summary'] = ''
         summary = str(state['summary'])[:600]
-        while count < len(old):
+        # Catch up at most two batches per reply so a long backlog never stalls her; the rest
+        # is summarized over the next turns.
+        batches = 0
+        while count < len(old) and batches < 2:
+            batches += 1
             batch, used = [], 0
             while count < len(old) and used < 2000 and len(batch) < 20:
                 row = dict(old[count]); row['content'] = row['content'][:2000-used]
