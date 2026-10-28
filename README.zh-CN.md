@@ -6,6 +6,15 @@
 
 支持私聊、群聊和长期记忆。默认打开控制台后保持暂停，由使用者选择聊天并开始。项目仍处于试验阶段，微信版本、窗口布局和显示缩放都可能影响识别。
 
+## 小千全家桶
+
+| 仓库 | 是什么 |
+|---|---|
+| **小千 · 本地版**（当前） | 自己电脑上跑，LM Studio 本地模型，画图、派活给 agent |
+| [小千 · 服务器版](https://github.com/AnthonyZZH/xiaoqian-wechat/tree/server) | 云服务器 24 小时在线，DeepSeek API，转告、@人、识图 |
+| [服务器部署 skill](https://github.com/AnthonyZZH/xiaoqian-server-deploy) | 从买服务器到上线的流程、脚本和排错手册 |
+| [她的图书馆](https://github.com/AnthonyZZH/ai-memory-public) | 多个 AI 共用的长期记忆、人格、成长引擎和社交补丁（去隐私公开版） |
+
 ## 功能
 
 - **参与对话**：合并短时间内的连续消息，判断是否在对机器人说话；群聊中按点名、上下文和频率决定是否插话。

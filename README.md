@@ -6,6 +6,15 @@ Xiaoqian (小千) is an AI WeChat chatbot and group-chat companion for Windows, 
 
 Supports private chats, group chats, editable long-term memory, and stickers. The control panel starts **paused**: choose a chat and start it yourself. This is an experimental project; WeChat updates, window layout, and display scaling can affect recognition.
 
+## The Xiaoqian family
+
+| Repository | What it is |
+|---|---|
+| **Xiaoqian · desktop** (this one) | runs on your PC with a local LM Studio model, drawing, agent hand-off |
+| [Xiaoqian · server](https://github.com/AnthonyZZH/xiaoqian-wechat/tree/server) | 24/7 on a cloud server, DeepSeek API, relays, @mentions, images |
+| [Server deployment skill](https://github.com/AnthonyZZH/xiaoqian-server-deploy) | process, scripts and troubleshooting from buying the server to going live |
+| [Her library](https://github.com/AnthonyZZH/ai-memory-public) | long-term memory shared by several AIs, persona, growth engine and social patches (public, de-identified) |
+
 ## Features
 
 - **Conversational participation:** batches consecutive messages and checks whether a reply is appropriate. Group participation considers mentions, recent context, and speaking frequency.
