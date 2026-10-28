@@ -1,5 +1,6 @@
 """Control window: pick the chat, persona and model; start/pause; close to stop completely."""
 import argparse
+from social_policy import chat_key
 import ctypes
 import json
 import queue
@@ -100,6 +101,7 @@ class Bot:
         self.runner = None
         self.runners = {}    # chat -> Runner, kept while switching so each chat keeps its place
         self.relays = []     # (chat, text) the owner asked her to say
+        self.owner_relay_requests = deque()
         self.drawings = {}   # job id -> (chat, what): pictures being drawn and where they go
         self.pictures = []   # (chat, image path or None, what, job id): finished, waiting to be sent
         self.gallery_lock = threading.Lock()  # images/index.json: the worker writes, the console reads
@@ -126,17 +128,16 @@ class Bot:
         self.learn_check_at = time.monotonic() + 300
 
     def emit(self, kind, payload):
-        self.events.put((kind, payload))
-        if kind in ("sessions", "models", "draw_models", "draw_control_result", "stickers", "chats", "memory", "memory_edit_result", "inbox"):
-            return
-        record = {"time": datetime.now().astimezone().isoformat(), "kind": kind,
-                  "chat": self.settings["chat"], "text": payload}
+        # The owner's console may show the real reason (it already shows chat text);
+        # the log file keeps only code-like payloads, never free text.
+        self.events.put((kind, str(payload)[:300] if kind == 'error' else payload))
+        record = {'time': datetime.now().astimezone().isoformat(), 'event': kind if kind in ('error','status','sent','received') else 'ui_event'}
+        if kind == 'error':
+            record['code'] = payload if isinstance(payload, str) and re.fullmatch(r'[A-Za-z0-9_]{1,64}', payload) else 'non_code'
         with self.log_lock:
-            logs = self.log_dir
-            logs.mkdir(parents=True, exist_ok=True)
-            with (logs / "events.jsonl").open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            (logs / "status.json").write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            with (self.log_dir / 'events.jsonl').open('a', encoding='utf-8') as f:
+                f.write(json.dumps(record)+'\n')
 
     def command(self, *args):
         self.commands.put(args)
@@ -151,24 +152,31 @@ class Bot:
     def runner_for(self, chat, reply_latest=False, outbound_mode=None):
         from runner import Runner
         if chat not in self.runners:
-            runner = Runner(self.settings, self.adapter, self.enabled, self.stop, self.emit,
-                            self.brain, chat, reply_latest=reply_latest, stickers=self.stickers,
-                            history_dir=self.data / "history", memory_dir=self.data / "memory",
-                            outbound_mode=outbound_mode)
-            groups = lambda: [c for c, i in self.settings["chats"].items() if i["mode"] == "group"]
-            # Relays need the multi-chat scheduler to carry them out.
-            runner.relay_targets = lambda: [c for c in self.settings["chats"] if c != self.settings["owner"]]
-            runner.should_yield = lambda r=runner: self.higher_priority(r)
-            runner.agent_command = self.agent_command
-            runner.group_command = self.group_command
-            runner.hand_off = self.hand_off
-            runner.on_heard = lambda r=runner: self.initiative.heard(r.chat, r.mode)
-            runner.on_spoke = lambda opening, r=runner: self.initiative.spoke(r.chat, r.mode, opening)
-            runner.on_declined = lambda r=runner: self.initiative.declined(r.chat, r.mode)
-            runner.context = lambda: "\n".join(
-                r.digest() for c, r in self.runners.items() if c in groups() and r.digest())
-            self.runners[chat] = runner
+            r = Runner(self.settings, self.adapter, self.enabled, self.stop, self.emit, self.brain, chat,
+                       reply_latest=reply_latest, stickers=self.stickers, history_dir=self.data/'history',
+                       memory_dir=self.data/'memory', outbound_mode=outbound_mode)
+            r.should_yield = lambda r=r: self.higher_priority(r)
+            r.on_heard = lambda r=r: self.initiative.heard(r.chat, r.mode)
+            r.on_spoke = lambda opening, r=r: self.initiative.spoke(r.chat, r.mode, opening)
+            r.on_declined = lambda r=r: self.initiative.declined(r.chat, r.mode)
+            r.owner_relay_command = lambda line, r=r: self.enqueue_owner_relay(r, line)
+            r.agent_command = self.agent_command
+            r.context = lambda r=r: self.owner_group_digest() if r.is_owner() else ''
+            self.runners[chat] = r
         return self.runners[chat]
+
+    def owner_group_digest(self):
+        """Only called by owner-private runner; never include another private chat."""
+        chunks=[]
+        groups=[chat for chat,info in self.settings.get('chats',{}).items()
+                if isinstance(info,dict) and info.get('mode') == 'group']
+        per_group=max(1,1200//max(1,len(groups)))
+        for chat in groups:
+            history=self.runner_for(chat).history
+            rows=[{'role':row.get('role'), 'text':str(row.get('text',''))[:200]}
+                  for row in history[-10:] if isinstance(row,dict) and row.get('role') in ('user','assistant')]
+            if rows: chunks.append(json.dumps({'group':chat,'recent':rows},ensure_ascii=False)[:max(0,per_group-1)])
+        return '\n'.join(chunks)[:1200]
 
     def activate(self, chat, reply_latest=False, outbound_mode=None):
         """Point the adapter and the active runner at `chat` (already open in WeChat)."""
@@ -176,7 +184,7 @@ class Bot:
         from senders import SenderBook
         mode = self.settings.chat_mode(chat) or outbound_mode
         info = self.settings["chats"].get(chat, {})
-        book = SenderBook(self.data / "senders" / f"{safe_name(chat)}.json", info.get("roster")) \
+        book = SenderBook(self.data / "senders" / f"{chat_key(chat, self.settings.chat_mode(chat))}.json", info.get("roster")) \
             if mode == "group" else None
         self.adapter.set_target(chat, mode, book, self.settings.get("group_layout"))
         self.runner = self.runner_for(chat, reply_latest, outbound_mode)
@@ -220,40 +228,118 @@ class Bot:
             < self.incoming.priority(runner.chat, chats, owner, runner)
 
     def send_picture(self, chat, path, what):
-        """A finished drawing (or word that it failed) to the chat that asked; never anywhere else."""
-        from runner import NOTICE_CHARS
-        source = self.runner.chat
-        try:
-            self.go(chat, outbound=True)
-            if path:
-                self.runner.show(path, f"画的{what[:20]}")
-            else:
-                self.runner.say(f"「{what[:20]}」没画出来，可能是图片生成出错了，换个说法再试试", "画图", NOTICE_CHARS)
-        finally:
-            try:
-                self.go(source)
-            except Exception:
-                self.enabled.clear()
-                self.emit("error", "无法返回原聊天，已暂停；不会向其他聊天继续发送")
+        return None
 
     def send_relay(self, chat, text, why="主人让我说的", limit=None, at=()):
-        """One exact recipient, no model call in the destination, no fallback chat.
+        return None
 
-        Returns the `at` members WeChat could not pick (sent as plain "@name")."""
-        source = self.runner.chat
+    def enqueue_owner_relay(self, runner, line):
+        from owner_relay import RELAY_HINT, resolve, guess, people_directory
+        if not runner.is_owner() or runner.replaying or not isinstance(line, str) or not RELAY_HINT.search(line):
+            return False
+        # The owner speaks loosely ("去饭友群说…"): let the model map it onto an allowed chat.
+        owner = self.settings.get('owner', '')
+        choices = [c for c, info in self.settings['chats'].items() if isinstance(info, dict) and c != owner]
         try:
-            self.go(chat, outbound=True)
-            missing = self.runner.say(text, why, limit, at) or []
-            self.emit("status", f"已向「{chat}」转告" if limit is None else f"已在「{chat}」发出{why}")
-        finally:
-            # Reading or model inference in the recipient chat must not accidentally
-            # send an unrelated reply or leave later owner work in the wrong chat.
+            people = people_directory(self.settings['chats'], owner, self.data)
+        except Exception:
+            people = None
+        try:
+            intent = (self.brain.relay_intent(line, choices, people) if people and people['groups']
+                      else self.brain.relay_intent(line, choices))
+        except Exception:
+            return False  # not sure it was a relay request: answer it as ordinary chat
+        if not intent['send']:
+            return False
+        target = intent['chat'] if resolve(intent['chat'], self.settings['chats'], owner) else guess(line, choices)
+        # Only @ someone the group's directory really lists; never a made-up name.
+        at = intent.get('at', '').strip()
+        if not target or at not in ((people or {}).get('groups', {}).get(target) or []):
+            at = ''
+        parsed = (target or '', line, at, '' if at else intent.get('hint', '').strip()[:20])
+        self.owner_relay_requests.append((runner, parsed))
+        return True
+
+    def process_owner_relay(self):
+        from owner_relay import RelayBudget, resolve, valid_text, EVERYONE
+        if not self.owner_relay_requests:
+            return False
+        runner, (asked, instruction, *rest) = self.owner_relay_requests.popleft()
+        at = rest[0] if rest else ''
+        hint = rest[1] if len(rest) > 1 else ''
+        owner = self.settings.get('owner', '')
+        epoch = self.enabled.epoch
+        cancel = lambda: self.stop.is_set() or not self.enabled.is_set() or self.enabled.epoch != epoch
+        try:
+            title, private = self.adapter.current()
+            if cancel() or runner is not self.runner or not runner.is_owner() or title != owner or not private:
+                raise RuntimeError('social_relay_origin_invalid')
+            target = resolve(asked, self.settings['chats'], owner)
+            ask = None
+            if hint and (not target or self.settings['chats'][target].get('mode') == 'group'):
+                # Find the person with WeChat's own @ list: it knows every member, our records may not.
+                groups = [target] if target else [c for c, info in self.settings['chats'].items()
+                                                  if isinstance(info, dict) and info.get('mode') == 'group']
+                found = []
+                for group in groups:
+                    if cancel():
+                        raise RuntimeError('social_relay_cancelled')
+                    self.go(group)
+                    self.adapter.validate()
+                    found += [(group, name) for name in self.adapter.members(hint, cancel) if name != owner]
+                self.go(owner)
+                if len(found) == 1:
+                    target, at = found[0]
+                    asked = target
+                elif found:
+                    ask = '你说的是哪位呀？' + '、'.join(f'{name}（{group}）' for group, name in found[:8])
+                else:
+                    ask = f'群里没找到「{hint}」这个人，你换个叫法？'
+            if ask:
+                receipt = ask
+            elif not target:
+                names = [c for c, info in self.settings['chats'].items() if isinstance(info, dict) and c != owner]
+                receipt = '你说的是哪个呀？可以发的有：' + '、'.join(names)
+            elif EVERYONE.search(instruction) or '@' in instruction or '＠' in instruction:
+                receipt = '这次不能使用艾特，没发出去。'
+            else:
+                try:
+                    text = self.brain.relay_text(instruction + (f'\n（在群里对{at}说，系统会自动@他，正文不用再写@）' if at else ''))
+                except Exception:
+                    text = None  # nothing was sent yet: tell the owner instead of pausing
+                if not valid_text(text):
+                    receipt = '这句我没写好，先没发出去，你换个说法再让我去一次？'
+                elif cancel() or resolve(asked, self.settings['chats'], self.settings.get('owner', '')) != target:
+                    raise RuntimeError('social_relay_authorization_changed')
+                else:
+                    self.go(target)
+                    self.adapter.validate()
+                    if cancel() or resolve(asked, self.settings['chats'], self.settings.get('owner', '')) != target:
+                        raise RuntimeError('social_relay_authorization_changed')
+                    if not RelayBudget(self.data/'relay-budget.json').reserve():
+                        receipt = '转告次数已达限制，或计数不可用，没发出去。'
+                    else:
+                        self.adapter.send(text, cancel=cancel, max_chars=100, at=(at,) if at else ())
+                        receipt = f'已经在「{target}」' + (f'@{at} ' if at else '') + f'说了：{text}'
+                    self.go(owner)
+            if cancel() or self.settings.get('owner', '') != owner:
+                raise RuntimeError('social_relay_origin_invalid')
+            title, private = self.adapter.current()
+            if title != owner or not private:
+                raise RuntimeError('social_relay_origin_invalid')
+            self.adapter.validate()
+            self.adapter.send(receipt, cancel=cancel, max_chars=200)
+        except Exception:
+            # An uncertain send is never retried. Keep a fixed diagnostic event only.
+            self.enabled.clear()
+            self.emit('error', 'SOCIAL_RELAY_FAILED')
             try:
-                self.go(source)
+                title, private = self.adapter.current()
+                if title != owner or not private:
+                    self.go(owner)
             except Exception:
-                self.enabled.clear()
-                self.emit("error", "无法返回原聊天，已暂停；不会向其他聊天继续发送")
-        return missing
+                pass
+        return True
 
     def watch(self):
         """Preserve every changed session; owner, then private chats, then groups."""
@@ -417,68 +503,32 @@ class Bot:
         if self.watch() is False:
             return
         self.runner.step()
+        if self.process_owner_relay():
+            return
         self.watch()
 
     # ---- owner commands in the owner's private chat: sends and local agents ----
     def agent_command(self, text, act=True):
-        """None for ordinary chat; else {"log": passphrase-free text, "reply": receipt}.
-
-        With act=False (messages from a pause) nothing is sent, started or stopped.
-        """
-        line = " ".join(str(text).split())
-        handled = self.owner_command(line, act, here=None)
-        if handled:
-            return handled
-        send = OWNER_SEND.fullmatch(line) or OWNER_SAY_IN.fullmatch(line)
-        if send and send["chat"] not in NOT_A_CHAT and send["chat"].casefold() not in AGENT_ALIASES:
-            if not act:
-                return {"log": line, "reply": None}
-            at = send.groupdict().get("at")
-            at = [self.settings["owner"] if at == "我" else at] if at else []
-            if send["chat"] in ("群", "群聊"):  # "在群里艾特我，说：…": fine only while there is one group
-                groups = [c for c, info in self.settings["chats"].items() if info["mode"] == "group"]
-                if len(groups) != 1:
-                    return {"log": line, "reply": "要发到哪个群？请写群名，例如“在示例群甲里说：…”"}
-                self.queue_owner_send(groups[0], send["text"], at)
-            else:
-                self.queue_owner_send(self.resolve_chat(send["chat"]), send["text"], at, send["chat"])
-            return {"log": line, "reply": None}
-        handled = self.agent_task(text, line, act) if self.settings["agents_enabled"] else None
-        if handled or not act or not SEND_HINT.search(line):
-            return handled
-        # Free wording ("在群里艾特我，说：测试一下"): the local model only extracts the
-        # request; the recipient is still checked here and the result reported truthfully.
-        try:
-            wish = self.brain.parse_send(line, chats=self.settings["chats"], owner=self.settings["owner"],
-                                         members=self.chat_members, jargon=self.chat_jargon)
-        except Exception as exc:
-            self.emit("error", f"没能理解这句是不是要代发：{exc}")
-            return None
-        if not (isinstance(wish, dict) and wish.get("send") is True):
-            return None
-        return {"log": line, "reply": self.owner_send_from(line, wish)}
+        # Runner invokes this callback only for the owner's private chat.
+        line = ' '.join(str(text).split())
+        match = re.fullmatch(r'(?:请|帮我)?(?:总结|概括|看看)\s*[「“]?(.+?)[」”]?\s*(?:最近|近期)的?聊天', line)
+        if match:
+            from owner_relay import resolve
+            name = match.group(1).strip(' 「」“”')
+            target = resolve(name, self.settings['chats'], self.settings.get('owner',''))
+            if not act: return {'log':line,'reply':None}
+            if not target: return {'log':line,'reply':'要看哪个聊天？请写允许列表里的完整名称。'}
+            try:
+                history = self.runner_for(target).history
+                reply = self.brain.summarize_chat(history) if history else '这个聊天还没有可供总结的记录。'
+            except Exception:
+                reply = '这次没有完成聊天总结。'
+                self.emit('error', 'SOCIAL_CHAT_SUMMARY_FAILED')
+            return {'log':line,'reply':reply}
+        return self.owner_command(line, act)
 
     def group_command(self, text, act=True, sender=""):
-        """Someone other than the owner's private chat: a group member addressing her, or a private
-        contact. The owner in a group gets blocking, memory and drawing; anyone else only drawing,
-        as the console's 画图授权 allows for that chat. Never sends elsewhere or runs other agent tasks,
-        since group sender names come from OCR and avatars."""
-        private = self.runner.mode == "private"
-        line = " ".join(str(text).replace(" ", " ").split())
-        if not private:
-            names = [self.runner.name] + [a for a in self.settings.get("aliases") or [] if a]
-            called = [n for n in names if f"@{n}" in line]
-            if not called:
-                return None
-            for n in called:
-                line = line.replace(f"@{n}", " ")
-        line, log = " ".join(line.split()), " ".join(str(text).split())
-        if sender == self.settings["owner"] and not private:
-            return self.owner_command(line, act, here=self.runner, log=log)
-        what = self.draw_wish(line)
-        if what is None:
-            return None
-        return {"log": log, "reply": self.member_draw(what, sender) if act else None}
+        return None
 
     def draw_rule(self, chat, mode):
         """Drawing rights in `chat`: {enabled, who: all|listed, names, limit, unlimited}.
@@ -563,9 +613,6 @@ class Bot:
     def owner_command(self, line, act, here=None, log=None):
         """拉黑 / 解除拉黑 / 黑名单 / 总结记忆. `here`: the group it was said in, else the owner's chat."""
         log = log or line
-        what = self.draw_wish(line)
-        if what is not None:  # the owner: no daily allowance
-            return {"log": log, "reply": self.draw(what, here) if act else None}
         if BLOCKLIST.fullmatch(line):
             entries = self.block_entries()
             listing = "；".join(self.block_label(e) for e in entries)
@@ -591,7 +638,7 @@ class Bot:
             return {"log": log, "reply": "这个不能拉黑"}
         name, minutes = split_duration(name)
         # From a group: in that group. From the owner's chat: everywhere.
-        reply = self.block(name, here.chat if here else None, minutes)
+        reply = self.block(name, here.chat if here else None, minutes, notify=False)
         return {"log": log, "reply": reply + ("" if seen else "（还没见过这个名字，按原样拉黑；名字要和群里显示的一致）")}
 
     def block_entries(self):
@@ -648,50 +695,13 @@ class Bot:
         return len(kept) != len(entries)
 
     def hand_off(self, kind, task):
-        """The chat model heard the owner ask for real work. Drawing goes to the draw agent, anything
-        else to Codex; the local agent only ever runs when the owner names it ("给本机 …")."""
-        if not self.settings["agents_enabled"]:
-            return None
-        if kind == "draw":
-            return self.draw(task)
-        if kind == "codex":
-            return self.dispatch("codex", task)
         return None
 
     def draw(self, what, here=None, who="主人"):
-        with self.draw_control_lock:
-            if self.draw_control_busy:
-                return "正在启动或加载/卸载生图模型，稍等一下再画"
-            return self._draw(what, here, who)
+        return None
 
     def _draw(self, what, here=None, who="主人"):
-        """Queue a picture independently of chatting; send it back to the requesting chat."""
-        import agents
-        chat = here.chat if here else self.settings["owner"]
-        what = " ".join(what.split()).strip("。.!！~～")[:200]
-        if any(j.agent == "draw" and j.status == "running" for j in self.agents.jobs()):
-            return "上一张还在画，画完再说"
-        self.agents.configs = self.agent_configs()
-        try:
-            config = self.agents.configs["draw"]
-            task = what if config.get("backend") == "forge" else agents.draw_task(what)
-            if config.get("backend") == "forge":
-                # Translate in the drawing thread; never block the WeChat scheduler.
-                model = config["model"]
-                import websearch
-                job_id = self.agents.start("draw", task, prepare=lambda description: self.brain.draw_prompts(
-                    description, model, search=websearch.search))
-            else:
-                job_id = self.agents.start("draw", task)
-        except Exception as exc:
-            return f"没法画：{exc}"
-        self.drawings[job_id] = (chat, what)
-        with self.gallery_lock:
-            self.draw_log.appendleft({"id": job_id, "who": who, "chat": chat, "what": what,
-                                      "state": "画图中", "started": time.time(), "ended": None, "note": ""})
-        self.emit("status", f"开始画：{what[:40]}")
-        return "好，已经排队画了，画好了发出来" if config.get("backend") == "forge" else \
-            "好，画好了发出来，大概要一分钟"
+        return None
 
     def draw_state(self, job_id, state, note=None):
         with self.gallery_lock:
@@ -856,7 +866,7 @@ class Bot:
         from personas import safe_name
         names = list((self.settings["chats"].get(chat) or {}).get("roster") or [])
         try:
-            book = json.loads((self.data / "senders" / f"{safe_name(chat)}.json").read_text(encoding="utf-8"))
+            book = json.loads((self.data / "senders" / f"{chat_key(chat, self.settings.chat_mode(chat))}.json").read_text(encoding="utf-8"))
         except Exception:
             book = []
         for person in book:
@@ -875,7 +885,7 @@ class Bot:
         from personas import safe_name
         from senders import SenderBook
         try:
-            book = json.loads((self.data / "senders" / f"{safe_name(chat)}.json").read_text(encoding="utf-8"))
+            book = json.loads((self.data / "senders" / f"{chat_key(chat, self.settings.chat_mode(chat))}.json").read_text(encoding="utf-8"))
         except Exception:
             book = []
         runner = self.runners.get(chat)
@@ -894,7 +904,7 @@ class Bot:
         Runs on the worker: the adapter may hold the same book in memory and save it."""
         from personas import safe_name
         from senders import SenderBook
-        path = self.data / "senders" / f"{safe_name(chat)}.json"
+        path = self.data / "senders" / f"{chat_key(chat, self.settings.chat_mode(chat))}.json"
         live = getattr(self.adapter, "book", None)
         book = live if live is not None and Path(live.path) == path else \
             SenderBook(path, (self.settings["chats"].get(chat) or {}).get("roster"))
@@ -910,7 +920,7 @@ class Bot:
         """The group's nicknames and slang from memory ("小王 / 老赵：…对应 小李"), as lines."""
         from personas import safe_name
         try:
-            data = json.loads((self.data / "memory" / f"{safe_name(chat)}.json").read_text(encoding="utf-8"))
+            data = json.loads((self.data / "memory" / f"{chat_key(chat, self.settings.chat_mode(chat))}.json").read_text(encoding="utf-8"))
             return [f"{term}：{entry.get('meaning', '')}" for term, entry in (data.get("jargon") or {}).items()][:60]
         except Exception:
             return []
@@ -931,22 +941,7 @@ class Bot:
         return hits[0] if hits else name
 
     def agent_configs(self):
-        configs = default_configs()
-        for name, config in configs.items():  # work and pictures live with the rest of her data
-            config["workdir"] = str(self.data / "agent_work" / name)
-        for name, extra in (self.settings.get("agent_overrides") or {}).items():
-            if name in configs and isinstance(extra, dict):
-                configs[name].update(extra)
-        from forge import DEFAULT_MODEL, DEFAULT_URL, LEGACY_MODEL
-        configs["draw"]["url"] = self.settings.get("forge_url") or DEFAULT_URL
-        configs["draw"]["model"] = self.settings.get("forge_model") or DEFAULT_MODEL
-        configs["draw"]["params"] = self.settings.get("draw_params") or {}
-        if self.settings.get("draw_backend") == LEGACY_MODEL:
-            # Explicit opt-in preserves the old online-reference workflow; never a silent fallback.
-            codex_cmd = default_configs()["codex"]["cmd"]
-            configs["draw"].update(backend="process", cmd=["{codex}", "--search", *codex_cmd[1:]],
-                                   model="gpt-6.1-sol", reasoning="low", timeout=300)
-        return configs
+        return {}
 
     @staticmethod
     def job_label(job):
@@ -954,16 +949,7 @@ class Bot:
         return f"{AGENT_NAMES.get(job.agent, job.agent)}「{task[:20] + '…' if len(task) > 20 else task}」"
 
     def dispatch(self, agent, task):
-        name = AGENT_NAMES.get(agent, agent)
-        if any(j.agent == agent and j.status == "running" for j in self.agents.jobs()):
-            return f"{name} 手上还有任务没做完，这个没派出去。发“任务”看进度，要换就先说“停掉{agent}”"
-        self.agents.configs = self.agent_configs()  # overrides apply from the next task on
-        try:
-            self.agents.start(agent, task)
-        except Exception as exc:
-            return f"没派出去：{exc}"
-        self.emit("status", f"已派给 {name}：{' '.join(task.split())[:60]}")
-        return f"收到，交给 {name} 了，做完告诉你"
+        return None
 
     def job_list(self):
         from runner import NOTICE_CHARS
@@ -1009,29 +995,10 @@ class Bot:
         return " ".join(f"{head}：{body} （日志 {job.log_path.name}）".split())[:NOTICE_CHARS]
 
     def collect_reports(self):
-        while True:
-            try:
-                job = self.finished.get_nowait()
-            except queue.Empty:
-                return
-            if job.id in self.drawings:
-                chat, what = self.drawings.pop(job.id)
-                path = self.drawn(job)
-                if path:
-                    self.note_drawing(path, what, chat)
-                self.draw_state(job.id, "画好了，等着发出去" if path else "没画出来",
-                                path.name if path else self.draw_reason(job))
-                self.pictures.append((chat, path, what, job.id))
-                continue
-            self.reports.append(self.report(job))
-            self.emit("status", f"{self.job_label(job)}{JOB_STATES.get(job.status, job.status)}，汇报会发到主人私聊")
+        return None
 
     def ensure_model(self):
-        model = self.settings["model"]
-        if self.lm.instances().get(model["identifier"]) != model["key"]:
-            self.emit("status", f"正在加载 {model['key']}（全部放到显卡）…")
-            self.lm.ensure(model["key"], model["identifier"], model["context"])
-            self.emit("status", f"模型已就绪：{model['key']}")
+        return None
 
     def handle(self, args):
         name = args[0]
@@ -1149,22 +1116,7 @@ class Bot:
             self.emit("status", f"模型已切换为 {key}。点“开始 / 继续”恢复")
 
     def scan_stickers(self):
-        self.emit("status", "正在后台让模型看一遍新表情包，聊天照常进行…")
-        try:
-            count = self.stickers.scan(self.brain.describe_image,
-                                       lambda done, total: self.emit("status", f"已整理 {done}/{total} 张"))
-        except Exception as exc:
-            self.emit("error", f"整理表情包出错：{exc}")
-            return
-        try:
-            from lmstudio import release_memory
-            release_memory()  # describing many images leaves caches behind in RAM
-        except Exception:
-            pass
-        skipped = self.stickers.skipped
-        self.emit("status", f"表情包库整理完成，新增 {count} 张，共 {len(self.stickers.catalog(1000))} 张"
-                  + (f"；跳过 {len(skipped)} 张（找不到或打不开，例如 {skipped[0]}）" if skipped else ""))
-        self.emit("stickers", self.stickers.catalog(1000))
+        self.emit('status', 'social_sticker_scan_disabled')
 
     def worker(self):
         try:
@@ -1203,52 +1155,14 @@ class Bot:
             self.emit("error", "启动失败：" + str(exc))
 
     def fetch_models(self):
-        def job():
-            try:
-                self.emit("models", {"models": self.lm.models(), "loaded": self.lm.instances()})
-            except Exception as exc:
-                self.emit("error", f"读取模型列表失败：{exc}")
-        threading.Thread(target=job, daemon=True).start()
+        return None
 
     def fetch_draw_models(self, url):
         # Network work never runs on the Tk thread or WeChat's worker thread.
-        def job():
-            from forge import Forge
-            try:
-                models = Forge(url).models()
-                self.emit("draw_models", {"url": url, "models": models, "error": ""})
-            except Exception as exc:
-                self.emit("draw_models", {"url": url, "models": [], "error": str(exc)})
-        threading.Thread(target=job, daemon=True).start()
+        return None
 
     def control_draw_model(self, action, url, model):
-        """Explicit UI-only model maintenance, serialized against this bot's drawing tasks."""
-        with self.draw_control_lock:
-            if self.draw_control_busy or any(j.agent == "draw" and j.status == "running" for j in self.agents.jobs()):
-                self.emit("draw_control_result", "画图或模型操作尚未结束，请稍后再试")
-                return
-            self.draw_control_busy = True
-            config = self.settings.snapshot()
-
-        def job():
-            from forge import Forge, start_server
-            try:
-                if action == "start":
-                    text = start_server(url, config, self.log_dir, cancel=self.stop.is_set)
-                elif action == "load":
-                    start_server(url, config, self.log_dir, cancel=self.stop.is_set)
-                    text = Forge(url).load()
-                elif action == "unload":
-                    text = Forge(url).unload()
-                else:
-                    raise ValueError("未知的模型操作")
-            except Exception as exc:
-                text = f"模型操作失败：{exc}"
-            finally:
-                with self.draw_control_lock:
-                    self.draw_control_busy = False
-            self.emit("draw_control_result", text)
-        threading.Thread(target=job, daemon=True).start()
+        return None
 
 
 class App:
@@ -1297,7 +1211,7 @@ class App:
         ttk.Button(bar, text="刷新微信会话", command=lambda: self.bot.command("sessions")).pack(side="left")
         self.multi = tk.BooleanVar(value=self.settings["multi_chat"])
         ttk.Checkbutton(frame, variable=self.multi, command=self.toggle_multi, text=(
-            "同时照看所有已允许的聊天（有新消息就自动切过去；主人私聊里可以让她去群里说话）")
+            "同时照看所有已允许的聊天（有新消息就自动切过去；回复只回当前聊天）")
                         ).pack(anchor="w", pady=(8, 0))
         bar2 = ttk.Frame(frame)
         bar2.pack(fill="x", pady=10)
@@ -1572,28 +1486,14 @@ class App:
 
     # ---- 模型 ----
     def build_model(self, frame):
-        self.model_info = tk.StringVar(value="读取中…")
-        ttk.Label(frame, textvariable=self.model_info, wraplength=700).pack(anchor="w")
-        row = ttk.Frame(frame)
-        row.pack(fill="x", pady=10)
-        ttk.Label(row, text="模型：").pack(side="left")
-        self.model_box = ttk.Combobox(row, state="readonly", width=70)
-        self.model_box.pack(side="left")
-        row2 = ttk.Frame(frame)
-        row2.pack(fill="x")
-        ttk.Label(row2, text="上下文长度：").pack(side="left")
-        self.model_ctx = ttk.Combobox(row2, values=["4096", "8192", "16384"], width=8)
-        self.model_ctx.set(str(self.settings["model"]["context"]))
-        self.model_ctx.pack(side="left")
-        ttk.Button(row2, text="刷新列表", command=self.bot.fetch_models).pack(side="left", padx=8)
-        ttk.Button(row2, text="估算显存", command=self.estimate_model).pack(side="left")
-        ttk.Button(row2, text="切换并加载", command=self.switch_model).pack(side="left", padx=8)
-        ttk.Label(frame, foreground="#777", wraplength=700, text=(
-            "模型总是整份放进显卡（RTX 5090 32GB）。如果显存不够，LM Studio 会拒绝加载，"
-            "而不是像之前那样一半放 CPU、让电脑变卡。切换只会卸载机器人自己的那份模型，"
-            "不动你在 LM Studio 里另外加载的模型。")).pack(anchor="w", pady=10)
-        self.models = []
-        self.bot.fetch_models()
+        ttk.Label(frame, text='DeepSeek API（密钥仅从进程环境变量读取）').pack(anchor='w')
+        self.api_base = tk.StringVar(value=self.settings['base_url'])
+        self.api_model = tk.StringVar(value=self.settings['model']['identifier'])
+        self.api_env = tk.StringVar(value=self.settings.get('api_key_env','DEEPSEEK_API_KEY'))
+        for label, variable in [('HTTPS Base URL',self.api_base),('Model',self.api_model),('密钥环境变量名',self.api_env)]:
+            ttk.Label(frame,text=label).pack(anchor='w')
+            ttk.Entry(frame,textvariable=variable,width=64).pack(anchor='w')
+        ttk.Button(frame,text='保存 API 设置',command=self.switch_model).pack(anchor='w')
 
     def chosen_model(self):
         index = self.model_box.current()
@@ -1617,17 +1517,19 @@ class App:
         threading.Thread(target=job, daemon=True).start()
 
     def switch_model(self):
-        key = self.chosen_model()
-        if not key:
-            return
-        try:
-            context = self.context()
-        except ValueError as exc:
-            messagebox.showerror("切换模型", str(exc))
-            return
-        if messagebox.askyesno("切换模型", f"暂停机器人，卸载当前模型，并把 {key} 整份加载到显卡？"):
-            self.bot.command("model", key, context)
-            self.window.after(3000, self.bot.fetch_models)
+        import urllib.parse
+        base = self.api_base.get().strip().rstrip('/')
+        url = urllib.parse.urlsplit(base)
+        if url.scheme != 'https' or url.hostname != 'api.deepseek.com' or url.username or url.password or url.query or url.fragment:
+            self.status.set('social_endpoint_rejected'); return
+        model = self.api_model.get().strip()
+        env = self.api_env.get().strip()
+        if not model or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*',env):
+            self.status.set('social_api_settings_invalid'); return
+        self.bot.enabled.clear()
+        self.settings.update(base_url=base,model={'key':'deepseek-api','identifier':model},api_key_env=env)
+        self.status.set('API 设置已保存；密钥仍只来自进程环境。')
+        self.refresh_header()
 
     def show_models(self, data):
         self.models = data["models"]
@@ -1954,100 +1856,7 @@ class App:
 
     # ---- 画图 ----
     def build_gallery(self, frame):
-        from forge import DEFAULT_MODEL
-        model_box = ttk.LabelFrame(frame, text="生图模型（本机 Forge / Stable Diffusion）", padding=8)
-        model_box.pack(fill="x", pady=(0, 8))
-        row = ttk.Frame(model_box)
-        row.pack(fill="x")
-        ttk.Label(row, text="服务地址：").pack(side="left")
-        self.forge_url = ttk.Entry(row, width=28)
-        self.forge_url.insert(0, self.settings["forge_url"])
-        self.forge_url.pack(side="left")
-        ttk.Button(row, text="刷新模型", command=self.refresh_draw_models).pack(side="left", padx=6)
-        row = ttk.Frame(model_box)
-        row.pack(fill="x", pady=4)
-        ttk.Label(row, text="模型：").pack(side="left")
-        self.draw_model = ttk.Combobox(row, state="readonly", width=32)
-        self.draw_model.pack(side="left", fill="x", expand=True)
-        model = self.settings["forge_model"] or DEFAULT_MODEL
-        self.set_draw_models({model.split(" [")[0].removesuffix(".safetensors"): model})
-        ttk.Button(row, text="保存模型", command=self.save_draw_model).pack(side="left", padx=6)
-        row = ttk.Frame(model_box)
-        row.pack(fill="x")
-        self.draw_control_buttons = []
-        for action, label in (("start", "启动 Forge"), ("load", "加载模型"), ("unload", "卸载生图模型")):
-            button = ttk.Button(row, text=label, command=lambda a=action: self.control_draw_model(a))
-            button.pack(side="left", padx=(0, 6))
-            self.draw_control_buttons.append(button)
-        self.draw_model_status = tk.StringVar(value="选择后保存，下一张生效；刷新可读取本机实际可用模型。")
-        ttk.Label(model_box, textvariable=self.draw_model_status, wraplength=760).pack(anchor="w", pady=(4, 0))
-        ttk.Label(model_box, text="Forge 可能和其他前端共用：画图参数只用于小千这一张，不改 Forge 的设置；"
-                  "它正在画图时不加载/卸载。卸载只释放 Forge 的显存，不动聊天模型。",
-                  wraplength=760).pack(anchor="w")
-        self.draw_prompt_text = tk.StringVar(value="英文提示词会在画图时自动转换，并显示在这里。")
-        ttk.Label(model_box, textvariable=self.draw_prompt_text, wraplength=740).pack(anchor="w")
-        rights = ttk.LabelFrame(frame, text="画图授权（按聊天分别设置；主人永远不限）", padding=8)
-        rights.pack(fill="x", pady=(0, 8))
-        row = ttk.Frame(rights)
-        row.pack(fill="x")
-        ttk.Label(row, text="聊天：").pack(side="left")
-        self.draw_chat = ttk.Combobox(row, state="readonly", width=18)
-        self.draw_chat.pack(side="left")
-        self.draw_chat.bind("<<ComboboxSelected>>", lambda e: self.load_draw_rule())
-        self.draw_enabled = tk.BooleanVar()
-        ttk.Checkbutton(row, text="允许画图，每人每天", variable=self.draw_enabled).pack(side="left", padx=(10, 0))
-        self.draw_limit = ttk.Spinbox(row, from_=0, to=50, increment=1, width=4)
-        self.draw_limit.pack(side="left", padx=4)
-        ttk.Label(row, text="张").pack(side="left")
-        row = ttk.Frame(rights)
-        row.pack(fill="x", pady=4)
-        self.draw_who = tk.StringVar(value="all")
-        self.draw_who_all = ttk.Radiobutton(row, text="群里所有人", value="all", variable=self.draw_who)
-        self.draw_who_all.pack(side="left")
-        self.draw_who_listed = ttk.Radiobutton(row, text="只限这些人：", value="listed", variable=self.draw_who)
-        self.draw_who_listed.pack(side="left", padx=(8, 0))
-        self.draw_names = ttk.Entry(row)
-        self.draw_names.pack(side="left", fill="x", expand=True)
-        row = ttk.Frame(rights)
-        row.pack(fill="x")
-        ttk.Label(row, text="不限次数的人（逗号分隔，和群里显示的名字一致）：").pack(side="left")
-        self.draw_unlimited = ttk.Entry(row)
-        self.draw_unlimited.pack(side="left", fill="x", expand=True)
-        row = ttk.Frame(rights)
-        row.pack(fill="x", pady=(4, 0))
-        self.draw_used = tk.StringVar()
-        ttk.Label(row, textvariable=self.draw_used).pack(side="left")
-        ttk.Button(row, text="保存这个聊天", command=self.save_draw_rights).pack(side="right")
-        ttk.Button(row, text="清零今天的次数", command=self.reset_draw_usage).pack(side="right", padx=6)
-        self.fill_draw_chats()
-        ttk.Label(frame, text="画图任务（程序这边的真实状态，每 2 秒刷新）：").pack(anchor="w")
-        self.draw_tasks = tk.Listbox(frame, height=4, exportselection=False)
-        self.draw_tasks.pack(fill="x")
-        self.draw_tasks_seen, self.draw_done_seen = None, 0
-        where = ttk.Frame(frame)
-        where.pack(fill="x", pady=6)
-        ttk.Label(where, text="保存位置：").pack(side="left")
-        self.gallery_dir = tk.StringVar()
-        ttk.Entry(where, textvariable=self.gallery_dir, state="readonly").pack(side="left", fill="x", expand=True)
-        ttk.Button(where, text="打开文件夹", command=self.open_gallery_folder).pack(side="left", padx=6)
-        ttk.Button(where, text="刷新", command=self.show_gallery).pack(side="left")
-        body = ttk.Frame(frame)
-        body.pack(fill="both", expand=True)
-        self.gallery_list = tk.Listbox(body, selectmode="extended", exportselection=False, width=46)
-        self.gallery_list.pack(side="left", fill="both", expand=True)
-        self.gallery_list.bind("<<ListboxSelect>>", lambda e: self.select_drawing())
-        self.gallery_preview = ttk.Label(body, text="选中一张看预览", width=36, anchor="center")
-        self.gallery_preview.pack(side="left", padx=10)
-        self.gallery_path = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.gallery_path, state="readonly").pack(fill="x", pady=(8, 0))
-        bar = ttk.Frame(frame)
-        bar.pack(fill="x", pady=6)
-        ttk.Button(bar, text="打开图片", command=self.open_drawing).pack(side="left")
-        ttk.Button(bar, text="复制路径", command=self.copy_drawing_path).pack(side="left", padx=8)
-        ttk.Button(bar, text="删除选中", command=self.delete_drawings).pack(side="right")
-        self.gallery_items = []
-        self.show_gallery()
-        self.window.after(500, self.show_draw_tasks)
+        ttk.Label(frame, text='社交模式：绘图、附件和外部代理已在代码层禁用。').pack(anchor='w')
 
     def set_draw_models(self, options):
         from forge import LEGACY_LABEL, LEGACY_MODEL

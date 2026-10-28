@@ -4,6 +4,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import os
 import re
 import struct
 import sys
@@ -33,6 +34,29 @@ _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 _user32.GetAncestor.restype = wintypes.HWND
 _user32.GetForegroundWindow.restype = wintypes.HWND
 _user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+_user32.IsIconic.argtypes = [wintypes.HWND]
+_user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int, wintypes.UINT]
+_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+_user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+
+# The server desktop has nobody watching it: keep WeChat on top instead of pausing
+# every round a console or Explorer window happens to cover the chat. Opt out with 0.
+KEEP_FRONT = os.environ.get("XQ_WECHAT_KEEP_FRONT", "1") != "0"
+SHELL_CLASSES = {"Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW"}
+
+
+def window_pid(hwnd):
+    pid = wintypes.DWORD()
+    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+
+def class_name(hwnd):
+    buffer = ctypes.create_unicode_buffer(256)
+    _user32.GetClassNameW(hwnd, buffer, 256)
+    return buffer.value
 
 
 def visible_point(hwnd, x, y):
@@ -138,8 +162,31 @@ class WeChatAdapter:
     def check_window(self):
         if not self.window.Exists(0.3):
             raise RuntimeError("微信主窗口未找到，请登录机器人微信")
+        if KEEP_FRONT:
+            self.keep_front()
         if self.window.IsOffscreen:
             raise RuntimeError("微信已最小化，请恢复窗口")
+
+    def keep_front(self):
+        """Restore WeChat, pin it topmost and minimize other apps' windows over it.
+
+        WeChat's own popups (same process) are left alone; a read they cover still
+        fails closed. Focus is not taken, so nothing typed elsewhere lands in WeChat.
+        """
+        hwnd = self.hwnd
+        if _user32.IsIconic(hwnd):
+            _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        # HWND_TOPMOST; SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+        _user32.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+        box, own = self.window.BoundingRectangle, window_pid(hwnd)
+        if box.width() <= 0 or box.height() <= 0:
+            return
+        for i in range(1, 6):
+            for j in range(1, 6):
+                point = wintypes.POINT(box.left + box.width() * i // 6, box.top + box.height() * j // 6)
+                top = _user32.GetAncestor(_user32.WindowFromPoint(point), 2)
+                if top and top != hwnd and window_pid(top) != own and class_name(top) not in SHELL_CLASSES:
+                    _user32.ShowWindow(top, 6)  # SW_MINIMIZE
 
     def current(self):
         """(title, is_private) of the chat open in WeChat, or (None, None)."""
@@ -601,6 +648,29 @@ class WeChatAdapter:
             raise
         self.press_send(edit, cancel, previous)
         return missing
+
+    def members(self, prefix, cancel=lambda: False):
+        """Group members WeChat's @ popover lists for `prefix`; the typed "@prefix" is removed again."""
+        typed = "".join(ch for ch in prefix if ord(ch) < 0x10000).split(" ")[0]
+        if self.mode != "group" or not typed:
+            return []
+        edit, previous = self.focus_input(cancel)
+        names = []
+        try:
+            edit.SendKeys("@" + typed, interval=0.03, waitTime=0.1)
+            popover = self.window.WindowControl(AutomationId="MentionPopover", searchDepth=30)
+            if self.wait_for(lambda: popover.Exists(0, 0), 2.0):
+                listing = popover.ListControl(searchDepth=6)
+                if listing.Exists(0.3):
+                    self.wait_for(lambda: bool(listing.GetChildren()), 1.5)
+                    names = [item.Name for item in listing.GetChildren() if item.Name][:20]
+        finally:
+            try:
+                edit.SendKeys("{Back}" * (len(typed) + 1), waitTime=0.05)
+            except Exception:
+                pass
+            self.restore(previous)
+        return [n for n in dict.fromkeys(names) if n not in ("所有人", "@所有人")]
 
     def mention(self, edit, member, cancel):
         """Type "@name" and pick exactly `member` in WeChat's member popover (the pyweixin way).

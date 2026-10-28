@@ -1,5 +1,6 @@
 """One chat's reply loop. Persistence and send control are independent of the LLM."""
 from __future__ import annotations
+from social_policy import chat_key
 
 import difflib
 import json
@@ -68,15 +69,10 @@ def sticker_hash(path):
 
 def load_history(path: Path, chat: str):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError):
-        pass
-    try:
-        # The Codex pilot kept history next to app.py; adopt it once, minus repeats.
-        old = json.loads((ROOT / f"history_{chat}.json").read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding='utf-8'))
+        return value if isinstance(value, list) else []
     except (FileNotFoundError, ValueError):
         return []
-    return [row for i, row in enumerate(old) if i == 0 or row != old[i - 1]]
 
 
 class Runner:
@@ -84,7 +80,7 @@ class Runner:
                  history_dir: Path = DATA / "history", reply_latest=False, stickers=None,
                  memory_dir: Path = DATA / "memory", outbound_mode=None):
         self.stickers = stickers
-        self.memory = Memory(Path(memory_dir) / f"{safe_name(chat)}.json")
+        self.memory = Memory(Path(memory_dir) / f"{chat_key(chat, settings.chat_mode(chat) or outbound_mode)}.json")
         self.learn_failed_at = -NEVER
         self.recent_stickers = deque()  # (monotonic, image hash) of stickers we pasted
         self.partner = ("", 0.0)  # group member last answered, and when
@@ -94,6 +90,7 @@ class Runner:
         self.context = lambda: ""
         self.relay = None
         self.relay_queue = deque()
+        self.owner_relay_command = lambda text: False
         self.should_yield = lambda: False
         # Owner commands for local agents, wired up by the scheduler: (text, act) ->
         # None when it is ordinary chat, else {"log": text without the passphrase,
@@ -121,7 +118,7 @@ class Runner:
         self.enabled, self.stop, self.emit = enabled, stop, emit
         self.reply_latest = reply_latest
         self.seen, self.seen_order = set(), deque()
-        self.history_path = Path(history_dir) / f"{safe_name(chat)}.json"
+        self.history_path = Path(history_dir) / f"{chat_key(chat, settings.chat_mode(chat) or outbound_mode)}.json"
         self.history = load_history(self.history_path, chat)
         # Where memory got to, kept next to the history so a restart does not forget it.
         self.learned_path = self.history_path.with_suffix(".learned")
@@ -239,39 +236,34 @@ class Runner:
         return any(distance(mark, sent) <= 10 for _, sent in self.recent_stickers for mark in marks)
 
     def describe(self, row):
-        """'[表情包：…]' text for an incoming picture; the bare label if the model can't see.
-
-        Stickers recur constantly, so descriptions are cached by image fingerprint.
-        """
-        if row.image is None or not self.config["describe_images"]:
-            return row.text
-        label = "图片" if "图片" in row.text else "视频" if "视频" in row.text else "表情包"
-        mark = avatar_hash(row.image)
-        known = next((desc for h, desc in IMAGE_CACHE if distance(h, mark) <= 6), None)
-        if known:
-            return f"[{label}：{known}]"
+        generic = '[收到一张图片]'
+        if (self.replaying or not self.config.get('describe_images', True)
+                or self.config.chat_mode(self.chat) != self.mode
+                or any(getattr(m, '_social_image_used', False) for m in self.pending)):
+            return generic
+        row._social_image_used = True
         try:
             desc = self.brain.describe_image(row.image)
-        except Exception as exc:
-            self.status(f"看不清这张图：{str(exc)[:60]}")
-            return row.text
-        if any(word in desc for word in PLACEHOLDER_WORDS):
-            return f"[{label}]"  # Never let a loading box become a topic.
-        if label == "表情包" and self.stickers and self.config["collect_stickers"]:
-            # Stickers only, never photos: people's pictures stay out of the library.
+        except Exception:
+            self.emit('error', 'SOCIAL_IMAGE_FAILED')
+            return generic
+        # Only explicitly labelled stickers are collected; photos never go to inbox.
+        label = str(getattr(row, 'text', ''))
+        if self.stickers and self.config.get('collect_stickers', True) and ('表情' in label or 'sticker' in label.lower()):
             try:
-                if self.stickers.inbox.add(row.image, desc, self.chat, getattr(row, "sender", ""),
-                                           self.stickers.hashes()):
-                    self.emit("inbox", desc)
-            except OSError:
-                pass
-        IMAGE_CACHE.append((mark, desc))
-        del IMAGE_CACHE[:-300]
-        return f"[{label}：{desc}]"
+                if self.stickers.inbox.add(row.image, desc, self.chat, getattr(row,'sender',''), self.stickers.hashes()):
+                    self.emit('inbox', 'SOCIAL_STICKER_INBOX_ADDED')
+            except Exception:
+                self.emit('error', 'SOCIAL_STICKER_INBOX_FAILED')
+        return '[图片描述：' + desc + ']'
 
     def accept(self, row):
         if row.role != "user" or self.own_echo(row.text):
             return False
+        if self.is_owner() and not self.replaying and getattr(row, 'image', None) is None and getattr(row, 'voice', None) is None and self.owner_relay_command(row.text):
+            self.history.append({"role": "user", "text": row.text})
+            self.emit("received", row.text)
+            return True
         if getattr(row, "voice", None) is not None:
             try:
                 row.text = self.adapter.transcribe(row)
@@ -319,7 +311,8 @@ class Runner:
         self.proactive_used = False
         self.next_proactive = NEVER
         self.muted = wants_silence(row.text, self.name)
-        self.emit("received", f"{sender}：{row.text}" if entry.get("sender") else row.text)
+        self.emit("received", 'SOCIAL_IMAGE_RECEIVED' if getattr(row, 'image', None) is not None else
+                  (f"{sender}：{row.text}" if entry.get("sender") else row.text))
         return True
 
     def catch_up(self, rows):
@@ -515,89 +508,24 @@ class Runner:
             self.save()
 
     def say(self, text, why="主人让我说的", limit=None, at=()):
-        """Send `text` in this chat without asking the model (owner relay, agent notices).
-
-        Same rules as any send: only while running, never retried, pause on doubt.
-        `limit` raises the length cap for agent notices only. `at` (groups only) are @-ed
-        for real; returns those WeChat could not pick, which went out as plain "@name".
-        """
-        text = " ".join(str(text).split())
-        if not text or len(text) > (limit or self.config["max_reply_chars"]):
-            raise ValueError("要转告的话为空或太长")
-        if not self.enabled.is_set() or self.stop.is_set():
-            raise RuntimeError("已暂停，没有转告")
-        epoch = self.enabled.epoch
-
-        def cancel():
-            return self.stop.is_set() or not self.enabled.is_set() or self.enabled.epoch != epoch
-
-        at = list(at) if self.mode == "group" else []
-        self.recent_sends.append((time.monotonic(), compact(text)))
-        try:
-            missing = self.adapter.send(text, cancel=cancel, **({"max_chars": limit} if limit else {}),
-                                        **({"at": at} if at else {})) or []
-        except Exception:
-            self.enabled.clear()
-            self.emit("error", "转告发送未确认，已暂停。请检查微信，避免重复。")
-            raise
-        shown = "".join(f"@{m} " for m in at) + text
-        self.sent(shown, proactive=True, notice=True)
-        self.status(f"已在「{self.chat}」说了（{why}）")
-        return missing
+        return False
 
     def show(self, path, label="图片"):
-        """Send an image file here without asking the model (a drawing). Same rules as say()."""
-        if not self.enabled.is_set() or self.stop.is_set():
-            raise RuntimeError("已暂停，没有发图")
-        epoch = self.enabled.epoch
-
-        def cancel():
-            return self.stop.is_set() or not self.enabled.is_set() or self.enabled.epoch != epoch
-
-        self.recent_stickers.append((time.monotonic(), sticker_hash(path)))  # its echo is not news
-        try:
-            self.adapter.send_image(path, cancel=cancel)
-        except Exception:
-            self.enabled.clear()
-            self.emit("error", "发图未确认，已暂停。请检查微信，避免重复。")
-            raise
-        self.sent(f"[图片：{label}]", proactive=True, notice=True)
-        self.status(f"已在「{self.chat}」发了图")
+        return False
 
     def deliver(self):
-        """Send notices oldest first; retry only failures known to occur before the click."""
-        from wechat_adapter import SendUncertain
-
-        while self.notices:  # the owner's chat, or a group where the owner gave a command
-            try:
-                self.say(self.notices[0], "任务回执", limit=NOTICE_CHARS)
-            except (SendUncertain, ValueError):
-                self.notices.popleft()
-                raise
-            else:
-                self.notices.popleft()
-        try:
-            self.ingest(self.adapter.read())
-        except Exception:
-            pass
+        return False
 
     def digest(self, rows=10):
-        """Recent lines of this chat, for the owner's private chat."""
-        lines = []
-        for r in self.history[-rows:]:
-            who = "你" if r["role"] == "assistant" else (r.get("sender") or "群友")
-            lines.append(f"  {who}：{r['text']}")
-        return f"【群「{self.chat}」最近的聊天】\n" + "\n".join(lines) if lines else ""
+        return ""
 
     def sticker_label(self, sid):
         return f"[表情包：{dict(self.stickers.catalog(1000)).get(sid, sid)}]"
 
     def model_failed(self, exc):
         self.error_count += 1
-        self.retry_after = time.monotonic() + min(60, 5 * 2 ** min(self.error_count, 4))
-        if self.error_count >= 3:
-            self.enabled.clear()
-            self.emit("error", f"模型连续 {self.error_count} 次出错，已暂停：{exc}")
+        self.retry_after = time.monotonic()+60
+        self.emit('error', 'social_model_failed')
 
     def resume(self, rows):
         """After any pause, messages from the pause go to context only, never answered late."""
@@ -664,8 +592,8 @@ class Runner:
                 and now - self.last_incoming <= self.config["proactive_window_seconds"])
 
     def step(self):
+        from social_policy import Budget, unsafe
         if not self.enabled.is_set() or self.stop.is_set():
-            self.status("已暂停")
             return
         rows = self.adapter.read()
         if not self.initialized:
@@ -674,196 +602,102 @@ class Runner:
             self.tail = [signature(r) for r in rows][-40:]
             self.initialized = True
             self.active_epoch = self.enabled.epoch
-            if self.reply_latest and rows and rows[-1].role == "user":
+            if self.reply_latest and rows and rows[-1].role == 'user':
                 self.replaying = True
                 try:
-                    changed = self.accept(rows[-1])
+                    self.accept(rows[-1]); self.save()
                 finally:
                     self.replaying = False
-                if changed:
-                    self.save()
-            self.status(f"监听中 · {self.chat}")
             return
         if self.enabled.epoch != self.active_epoch:
-            self.resume(rows)
-            return
+            self.resume(rows); return
         self.ingest(rows)
-        if self.resume_once and self.catch_up(rows):
-            self.resume_once = False  # answered as new messages, not as a resume
-            self.insist = True  # but still always answered
-            self.save()
-        if self.notices:
-            self.deliver()
+        if self.resume_once:
+            self.resume_once = False
+            self.replaying = True
+            try:
+                changed = self.catch_up(rows)
+            finally:
+                self.replaying = False
+            if changed:
+                self.save()
+            if not self.pending and any(r.get('role') == 'user' for r in self.history):
+                self.opening = {'resume': True}
+        if self.notices and self.is_owner():
+            notice = self.notices.popleft()  # never retry an uncertain send
+            epoch = self.enabled.epoch
+            cancel = lambda: self.stop.is_set() or not self.enabled.is_set() or self.enabled.epoch != epoch
+            try:
+                if cancel(): return
+                title, private = self.adapter.current()
+                if title != self.chat or not private: raise RuntimeError('social_owner_notice_target_invalid')
+                self.adapter.validate()
+                self.adapter.send(notice, cancel=cancel)
+            except Exception:
+                self.enabled.clear()
+                self.emit('error', 'SOCIAL_OWNER_NOTICE_FAILED')
             return
         now = time.monotonic()
-        if self.expired(now) or now < self.retry_after:
+        if self.expired(now) or now < self.retry_after or self.should_yield():
             return
-        has_pending = bool(self.pending)
-        if has_pending and now - self.last_incoming < self.config["batch_seconds"]:
-            self.status("等这一轮说完…")
+        pending = list(self.pending)
+        if pending and now-self.last_incoming < self.config['batch_seconds']:
             return
-        proactive = not has_pending
-        opening, self.opening = (self.opening if proactive else None), None
-        if proactive and self.resume_once:
-            # What the other side said last, whatever she has said since; nothing is written as
-            # if they had said it again.
-            recent = [f"{r['sender']}：{r['text']}" if r.get("sender") else r["text"]
-                      for r in self.history if r["role"] == "user"][-5:]
-            opening = {"resume": recent}
-        self.resume_once = False
-        insist, self.insist = self.insist and has_pending, False
-        resuming = bool(opening and "resume" in opening)
-        # The owner's rule: a private chat is always answered, and 重新接话 always says something.
-        must_reply = resuming or insist or (self.mode == "private" and bool(self.pending))
-        if proactive and not opening and not self.may_proactive(now):
-            if not self.learn(now):
-                self.status(f"监听中 · {self.chat}")
+        names = [self.name]+list(self.config.get('aliases', []))
+        mentioned = any(mentions(m.text,n) for m in pending for n in names if n)
+        opening, self.opening = self.opening, None
+        mandatory = bool(pending) and (self.mode == 'private' or mentioned)
+        proactive = not mandatory
+        if self.muted and not mandatory:
             return
-        if self.muted and opening and not resuming:
-            self.on_declined()
+        if not pending and not opening and not self.may_proactive(now):
+            self.learn(now)
             return
-        if self.muted and not must_reply:  # a private chat and 重新接话 outrank a hush
-            self.pending.clear()
-            self.proactive_used = True
-            self.status("本轮保持安静 · 新消息可重新开始")
-            return
-        # Her persona name, plus the bot account's WeChat nickname that @ uses.
-        names = [self.name] + [n for n in self.config.get("aliases", []) if n]
-        mentioned = any(mentions(m.text, n) for m in self.pending for n in names)
-        continuing = False
-        if self.mode == "group" and not mentioned and not opening:
-            # Whoever she just answered may keep talking to her (attention), but the
-            # model still judges whether it is addressed to her. Otherwise she cools
-            # down between interjections, tires after a run, and only sometimes even
-            # considers chiming in (cheap first filter, as in Group Chat Plus).
-            partner, since = self.partner
-            if any(getattr(m, "sender", "") == partner for m in self.pending) and now - since < 120:
-                continuing = True
-            elif now - self.last_send < self.config["group_gap_seconds"]:
-                self.pending.clear()
-                self.status("群里刚说过话，这轮不插嘴")
-                return
-            elif sum(now - t < 300 for t in self.sent_times) >= 4:
-                self.pending.clear()
-                self.status("这会儿说得够多了，先听大家聊")
-                return
-            elif random.random() >= self.config["group_chime_in"]:
-                self.pending.clear()
-                self.status("没叫她，这轮先听着")
-                return
-        replying_to = getattr(self.pending[-1], "sender", "") if self.pending else ""
+        continuing = self.mode == 'group' and bool(self.partner[0]) and now-self.partner[1] < 120 and any(getattr(m,'sender','') == self.partner[0] for m in pending)
+        if pending and proactive and not continuing and (now-self.last_send < self.config['group_gap_seconds'] or random.random() >= self.config['group_chime_in']):
+            self.pending.clear(); return
         if not self.allowed_to_send():
-            self.status("控制发言频率中")
             return
-        self.status("想想怎么接上刚才的话…" if resuming else "想想要不要冒个泡…" if opening
-                    else "想一句自然的接话…" if proactive
-                    else f"{self.name}正在想怎么接话…")
         epoch = self.enabled.epoch
-        pending_keys = [m.key for m in self.pending]
-        try:
-            ask = dict(
-                chat=self.chat, mode=self.mode, mentioned=mentioned,
-                continuing=continuing,
-                memory=self.memory.prompt_block(self.speakers()) if self.config["memory_enabled"] else "",
-                **({"batch": [{"text": m.text, "sender": getattr(m, "sender", "")} for m in self.pending]}
-                   if len(self.pending) > 1 else {}),
-                **({"relay_targets": self.relay_targets(), "context": self.context(),
-                    "relay_messages": [m.text for m in self.pending], "handoff": True}
-                   if self.is_owner() and not opening else {}),
-                **({"opening": opening} if opening else {}))
-            result = self.brain.decide(self.history, proactive, **ask)
-            speak, text, sticker = self.parse(result)
-            odd_private = self.mode == "private" and any(getattr(m, "odd", False) for m in self.pending)
-            if odd_private and not speak:
-                speak, text, sticker = self.odd_private_reply()
-            if speak and not must_reply and not odd_private and not proactive and not mentioned \
-                    and isinstance(result, dict) and result.get("to_me") is False:
-                speak = False  # Read the room: not talking to her, so she stays out of it.
-            handoff = isinstance(result, dict) and isinstance(result.get("handoff"), dict) \
-                and result["handoff"].get("kind") in ("draw", "codex")
-            if must_reply and not speak and not handoff:
-                # Asked to stay silent, or her line was dropped (a repeat, half a sentence): ask once
-                # more, insisting; then a short line of last resort.
-                speak, text, sticker = self.parse(self.brain.decide(self.history, proactive, force=True, **ask))
-                if not speak:
-                    speak, text, sticker = self.fallback_reply(MUST_REPLIES)
-        except Exception as exc:
-            self.model_failed(exc)
-            raise
-        self.error_count = 0
-
+        keys = [m.key for m in pending]
         def cancel():
             return self.stop.is_set() or not self.enabled.is_set() or self.enabled.epoch != epoch
-
-        if cancel():
-            self.status("已暂停 · 本次草稿作废")
-            return
-        # A reply based on stale history must never be sent.
-        if self.ingest(self.adapter.read()):
-            self.status("收到新消息，重新想一句")
-            return
-        if pending_keys != [m.key for m in self.pending] or self.expired(time.monotonic()):
-            return
-        if self.should_yield():
-            self.status("先处理更高优先级的消息，本轮待办保留")
-            return
-        requested = recipients([m.text for m in self.pending], self.relay_targets(),
-                               [c for c, info in self.config.get("chats", {}).items() if info["mode"] == "group"])
-        self.pending.clear()
-        if self.is_owner() and isinstance(result, dict):
-            proposed = result.get("relays") or ([result["relay"]] if result.get("relay") else [])
-            for target, body in proposed:
-                if target in requested and body:
-                    self.relay_queue.append((target, body))
-                else:
-                    self.emit("error", "转告目标与主人指定的不一致，已拒绝；不会改发到其他聊天")
-        handoff = result.get("handoff") if self.is_owner() and not opening and isinstance(result, dict) else None
-        if isinstance(handoff, dict) and handoff.get("kind") in ("draw", "codex") \
-                and str(handoff.get("task") or "").strip():
-            # Real work goes to an agent now, and she only says what really happened.
-            receipt = self.hand_off(handoff["kind"], " ".join(str(handoff["task"]).split()))
-            if receipt:
-                speak, text, sticker = True, receipt, None
-        if proactive:
-            self.proactive_used = True  # Also stop repeated polling if the LLM chose silence.
-        if not speak:
-            self.proactive_used = True
-            self.status("这会儿接不上话，先不说" if resuming else "这会儿没什么好说的，先不冒泡" if opening
-                        else "这轮先不接话")
-            if opening and not resuming:
-                self.on_declined()
-            return
-        if not self.allowed_to_send():
-            self.status("控制发言频率中 · 本次草稿作废")
-            return
-        self.opening_active = bool(opening) and not resuming  # only her own openings count as unanswered
         try:
+            # Retrieval reads ONLY this runner's local Memory, selecting <=5 entries.
+            facts = self.memory.social_retrieve(' '.join(m.text for m in pending)[-2000:]) if self.config['memory_enabled'] else []
+            group_digest = self.context() if self.is_owner() else ''
+            result = self.brain.decide(self.history, proactive, chat=self.chat, mode=self.mode, memory=facts, mentioned=mentioned, opening=opening, group_digest=group_digest)
+            self.proactive_used = True
+            self.pending.clear()
+            if not isinstance(result,dict) or not result.get('speak') or unsafe(result.get('text','')):
+                return
+            if self.mode == 'group' and pending and not mentioned and result.get('to_me') is False:
+                return
+            text = result.get('text','')
+            sid = result.get('sticker','')
+            # Catalog resolution never accepts a model path. Resolve again at send time.
+            path = self.stickers.path(sid) if self.stickers and sid else None
+            if not text and not path:
+                return
+            if cancel() or self.ingest(self.adapter.read()) or self.should_yield():
+                return
+            budget = Budget(self.history_path.parent/'social-budget.json', self.config.get('social_timezone','Asia/Shanghai'))
+            if not budget.reserve(self.chat, proactive):
+                return
+            # One worker owns adapter activation. Do not accept a destination from Brain.
             if text:
-                # Remember before sending: an uncertain send may still land in the chat.
-                self.recent_sends.append((time.monotonic(), compact(text)))
-                self.adapter.send(text, cancel=cancel)
-                self.sent(text, proactive)
-            if sticker:
-                sid, path = sticker
-                self.recent_stickers.append((time.monotonic(), sticker_hash(path)))
-                self.adapter.send_image(path, cancel=cancel)
-                self.sent(self.sticker_label(sid), proactive)
+                self.recent_sends.append((time.monotonic(),compact(text)))
+                self.adapter.send(text,cancel=cancel)
+                self.sent(text,proactive)
+                if self.mode == 'group' and pending and getattr(pending[-1], 'sender', ''):
+                    self.partner = (pending[-1].sender, time.monotonic())
+            if path:
+                checked = self.stickers.path(sid)
+                if checked != path:
+                    raise RuntimeError('social_sticker_changed')
+                self.adapter.send_image(checked,cancel=cancel)
+                self.sent(self.sticker_label(sid),proactive)
         except Exception:
-            # Any uncertain UI send requires human inspection. Never retry.
-            cancelled = cancel()
-            self.opening_active = False
+            self.model_failed(None)
+            # Uncertain UI sends must not be retried. Owner can inspect then resume.
             self.enabled.clear()
-            self.proactive_used = True
-            self.next_proactive = NEVER
-            self.emit("error", "已暂停，草稿未发送；请检查微信输入框是否留有文字。" if cancelled
-                      else "发送未确认，已暂停。请检查微信输入框和消息，避免重复。")
-            raise
-        self.status("已发出 · 没人接话时最多再主动接一次" if self.mode == "private" else "已发出")
-        if replying_to:
-            self.partner = (replying_to, time.monotonic())
-        try:
-            # Messages that arrived while typing are queued now, so they are not
-            # mistaken for old rows once our bubble becomes the newest seen row.
-            self.ingest(self.adapter.read())
-        except Exception:
-            pass

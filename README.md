@@ -6,6 +6,32 @@ Xiaoqian (小千) is an AI WeChat chatbot and group-chat companion for Windows, 
 
 Supports private chats, group chats, editable long-term memory, and stickers. The control panel starts **paused**: choose a chat and start it yourself. This is an experimental project; WeChat updates, window layout, and display scaling can affect recognition.
 
+> **You are on the `server` branch: the server edition.** It keeps Xiaoqian online 24/7 on a dedicated Windows cloud server, with the DeepSeek API as her brain.
+> The desktop edition (local LM Studio model, drawing, agent hand-off) lives on [`main`](https://github.com/AnthonyZZH/xiaoqian-wechat/tree/main).
+> The full server deployment (buying and hardening the server, WeChat/QQ, watchdog, troubleshooting) is in [xiaoqian-server-deploy](https://github.com/AnthonyZZH/xiaoqian-server-deploy).
+
+## Server edition (`server` branch)
+
+| | Desktop (`main`) | Server (`server`) |
+|---|---|---|
+| Brain | Local LM Studio model | DeepSeek API (`deepseek-flash`, thinking off by default, JSON output, no tool calls) |
+| Where | Your own PC, attended | Dedicated Windows cloud server, unattended |
+| Drawing / Forge / agent hand-off | Yes | Removed (no GPU; isolated from personal machines) |
+| Context cost | Depends on the local model | Per chat: last 20 messages + rolling summary + up to 5 retrieved memories — cost does not grow with the conversation |
+| Data folder | `data/` | Can live outside the app: `XQ_WECHAT_DATA_DIR` |
+
+- **Owner relays in plain words** — "去面包群说…" is mapped by the model onto an allowed chat (name-overlap fallback); she speaks to that chat in her own voice and reports back.
+- **Relay to a person, with a real @** — "给张哥发消息…": the person is found from memory facts, group slang and member lists (or WeChat's own @ list); a person with an allowed private chat is messaged there, otherwise @-ed in their group. Never @everyone, never the owner; someone claiming to be the owner in a group gets nothing.
+- **Images and stickers** — images are described by DeepSeek; 20 stickers are sampled from the whole library each turn; new stickers go to a review inbox.
+- **Group news in the owner's private chat only.**
+- **Unattended** — WeChat is restored and kept on top before every read, covering windows of other apps are minimized (`XQ_WECHAT_KEEP_FRONT=0` to disable); `--start` starts replying at launch.
+- **Fixes** — rolling summary realigns after history is trimmed; reliable JSON with long histories; the console shows the real error (log files keep codes only).
+- **Floors** — official DeepSeek host only, no proxy or redirects; key from the environment only; relay limits (10/hour, 40/day); cooldown and quiet hours for unprompted messages.
+
+Setup: WeChat 4.x logged in, 64-bit Python 3.12, `pip install -r requirements.txt`; set `XQ_DEEPSEEK_API_KEY` (and optionally `XQ_WECHAT_DATA_DIR`); in `settings.json` set `chats`, `owner`, `api_key_env`, `model.identifier`, `thinking`; run `python app.py` (paused) or `python app.py --start`. Run the no-send test before going live.
+
+Server edition history: **server-1** (2026-10) — everything above; built by Claude and Codex together (see Contributors).
+
 ## Features
 
 - **Conversational participation:** batches consecutive messages and checks whether a reply is appropriate. Group participation considers mentions, recent context, and speaking frequency.
@@ -140,4 +166,5 @@ Every update is tagged as a small version (`v0.x`); the full notes are in [CHANG
 
 - [AnthonyZZH](https://github.com/AnthonyZZH) — maintainer
 - [Codex](https://github.com/codex) (OpenAI) — implementation, review and testing
-- Claude (Anthropic) — implementation and review
+- Claude (Anthropic) — implementation and review; server edition architecture, patches and deployment
+- Server edition: Codex (OpenAI) built the hardening patches, the DeepSeek brain, relay and image features with paired tests; Claude planned, reviewed, debugged and wrote the fix patches

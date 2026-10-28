@@ -129,11 +129,8 @@ class StickerLibrary:
         return [(sid, row["desc"]) for sid, row in rows if sid in files and row.get("desc")][:limit]
 
     def path(self, sid):
-        if sid in self.index:
-            path = self.folder / self.index[sid]["file"]
-            if path.exists():
-                return path
-        return None
+        from social_policy import selected_sticker
+        return selected_sticker(self, sid)
 
     def set_desc(self, sid, desc):
         """The owner's wording wins; rescans keep it because the file is unchanged."""

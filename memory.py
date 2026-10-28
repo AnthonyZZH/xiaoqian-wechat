@@ -240,3 +240,18 @@ class Memory:
         if not self.jargon:
             out.append("（还没有）")
         return "\n".join(out)
+
+
+    @locked
+    def social_retrieve(self, query):
+        """At most five locally stored facts, no global or other-chat material."""
+        items = []
+        for name, row in self.people.items():
+            items.extend(name+': '+str(v) for v in row.get('facts', []))
+            if row.get('impression'):
+                items.append(name+': '+str(row['impression']))
+        items.extend(str(k)+': '+str(v.get('meaning','')) for k,v in self.jargon.items())
+        # Chinese character overlap is deterministic and does not need packages.
+        terms = set(str(query)) - set(' ，。！？的了是我你他她')
+        ranked = sorted(enumerate(items), key=lambda p: (-len(terms & set(p[1])), p[0]))
+        return [text[:200] for _,text in ranked if terms & set(text)][:5]

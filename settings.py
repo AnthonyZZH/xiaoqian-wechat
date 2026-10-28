@@ -1,18 +1,24 @@
 """Live settings shared by the control window and the worker thread."""
 from __future__ import annotations
 
+import os
 import copy
 import json
 import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data"
+_data_override = os.environ.get("XQ_WECHAT_DATA_DIR", "").strip()
+if _data_override and not Path(_data_override).is_absolute():
+    raise ValueError("XQ_WECHAT_DATA_DIR must be absolute")
+DATA = Path(_data_override).resolve() if _data_override else ROOT / "data"
 
 DEFAULTS = {
-    "base_url": "http://127.0.0.1:1234/v1",
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "social_timezone": "Asia/Shanghai",
     "lms_path": str(Path.home() / ".lmstudio" / "bin" / "lms.exe"),
-    "model": {"key": "your-local-model", "identifier": "xiaoqian-qwen", "context": 8192},
+    "model": {"key": "deepseek-api", "identifier": "deepseek-chat", "context": 8192},
     "persona": "小千",
     "chat": "示例好友",
     # Only chats listed here can ever be read or answered.
@@ -56,13 +62,13 @@ DEFAULTS = {
     "memory_auto_minutes": 60,
     "memory_auto_min_new": 6,
     # The owner's private chat can hand tasks to local command-line agents (agents.py).
-    "agents_enabled": True,
+    "agents_enabled": False,
     "agent_passphrase": "",  # empty: no passphrase needed
     "agent_overrides": {},   # fields over agents.default_configs(), e.g. {"codex": {"model": "…"}}
     # Names whose messages she no longer takes in, in any chat ("拉黑 小李" from the owner).
     "blocked": [],
     # Drawing (Codex's image tool): group members who @ her get this many pictures a day; the owner has no limit.
-    "draw_for_members": True,
+    "draw_for_members": False,
     "draw_daily_limit": 3,
     "draw_unlimited": [],  # group member names with no daily limit
     # Per chat, set on the console: {chat: {"enabled", "who": "all"|"listed", "names", "limit", "unlimited"}}.
