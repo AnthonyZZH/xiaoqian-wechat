@@ -10,6 +10,15 @@ Supports private chats, group chats, editable long-term memory, and stickers. Th
 > The desktop edition (local LM Studio model, drawing, agent hand-off) lives on [`main`](https://github.com/AnthonyZZH/xiaoqian-wechat/tree/main).
 > The full server deployment (buying and hardening the server, WeChat/QQ, watchdog, troubleshooting) is in [xiaoqian-server-deploy](https://github.com/AnthonyZZH/xiaoqian-server-deploy).
 
+## The Xiaoqian family
+
+| Repository | What it is |
+|---|---|
+| [Xiaoqian · desktop](https://github.com/AnthonyZZH/xiaoqian-wechat) | runs on your PC with a local LM Studio model, drawing, agent hand-off |
+| **Xiaoqian · server** (this one) | 24/7 on a cloud server, DeepSeek API, relays, @mentions, images |
+| [Server deployment skill](https://github.com/AnthonyZZH/xiaoqian-server-deploy) | process, scripts and troubleshooting from buying the server to going live |
+| [Her library](https://github.com/AnthonyZZH/ai-memory-public) | long-term memory shared by several AIs, persona, growth engine and social patches (public, de-identified) |
+
 ## Server edition (`server` branch)
 
 | | Desktop (`main`) | Server (`server`) |
