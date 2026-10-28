@@ -9,6 +9,7 @@ import re
 import time
 from collections import deque
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
 from brain import EMOJI_REPEAT_REPLIES, mentions, recent_wechat_emojis, wants_silence
@@ -620,6 +621,32 @@ class Runner:
                 and not self.muted and not self.quiet() and now >= self.next_proactive
                 and now - self.last_incoming <= self.config["proactive_window_seconds"])
 
+    def queue_balance_alert(self):
+        """Reserve one owner notice per local day, including across restarts."""
+        if not self.is_owner():
+            return
+        try:
+            from social_policy import process_lock, zone, _LOCK
+            snapshot = self.brain.balance()
+            if not snapshot or snapshot.get('currency') != 'CNY':
+                return
+            amount = Decimal(snapshot['total_balance'])
+            threshold = Decimal(str(self.config.get('balance_alert', 10)))
+            if not amount.is_finite() or not threshold.is_finite() or amount >= threshold:
+                return
+            today = datetime.now(zone(self.config.get('social_timezone', 'Asia/Shanghai'))).date().isoformat()
+            path = DATA / 'balance-alert.json'
+            with _LOCK, process_lock(path.with_suffix('.lock')):
+                state = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+                if not isinstance(state, dict) or state.get('date') == today:
+                    return
+                temp = path.with_suffix('.tmp')
+                temp.write_text(json.dumps({'date': today}), encoding='utf-8')
+                temp.replace(path)
+                self.notices.append(f"提醒一下，我的 DeepSeek 余额只剩 ¥{amount} 了。")
+        except Exception:
+            self.emit('error', 'SOCIAL_BALANCE_ALERT_FAILED')
+
     def step(self):
         from social_policy import Budget, unsafe
         if not self.enabled.is_set() or self.stop.is_set():
@@ -652,6 +679,8 @@ class Runner:
                 self.save()
             if not self.pending and any(r.get('role') == 'user' for r in self.history):
                 self.opening = {'resume': True}
+        if self.is_owner():
+            self.queue_balance_alert()
         if self.notices and self.is_owner():
             notice = self.notices.popleft()  # never retry an uncertain send
             epoch = self.enabled.epoch

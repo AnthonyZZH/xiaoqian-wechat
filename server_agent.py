@@ -55,10 +55,15 @@ class ServerAgent:
         work.mkdir(parents=True, exist_ok=True)
         logs.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, DSH_HOME=str(self.root / 'dsh-home'), DSH_TELEMETRY_DISABLED='1',
+                   DSH_PERMISSION_MODE='danger-full-access',
                    DEEPSEEK_API_KEY=os.environ.get(self.key_env, ''))
+        instructions = (r'你在一台 Windows 服务器上，有完整权限。需要插件时可执行 '
+                        r'C:\xiaoqian\app\dsh\node_modules\.bin\dsh.cmd plugin --profile headless add <包名>'
+                        r' 安装，DSH_HOME=C:\xiaoqian\data\agent\dsh-home，装完下一次任务生效。'
+                        '\n\n')
         started = time.monotonic()
         try:
-            done = subprocess.run([str(NODE), str(DSH_BIN), 'headless', task], cwd=work, env=env,
+            done = subprocess.run([str(NODE), str(DSH_BIN), 'headless', instructions + task], cwd=work, env=env,
                                   capture_output=True, text=True, encoding='utf-8', errors='replace',
                                   timeout=TIMEOUT, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             (logs / f'{job}.log').write_text(done.stdout + '\n' + done.stderr, encoding='utf-8')

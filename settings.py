@@ -16,6 +16,7 @@ DATA = Path(_data_override).resolve() if _data_override else ROOT / "data"
 DEFAULTS = {
     "base_url": "https://api.deepseek.com/v1",
     "api_key_env": "DEEPSEEK_API_KEY",
+    "balance_alert": 10,
     "social_timezone": "Asia/Shanghai",
     "lms_path": str(Path.home() / ".lmstudio" / "bin" / "lms.exe"),
     "model": {"key": "deepseek-api", "identifier": "deepseek-chat", "context": 8192},
