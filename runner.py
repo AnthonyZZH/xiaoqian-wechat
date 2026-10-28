@@ -694,7 +694,9 @@ class Runner:
             if cancel() or self.ingest(self.adapter.read()) or self.should_yield():
                 return
             budget = Budget(self.history_path.parent/'social-budget.json', self.config.get('social_timezone','Asia/Shanghai'))
-            if not budget.reserve(self.chat, proactive):
+            # The owner wants her to speak up whenever she likes: no night silence or hourly cap
+            # for the owner's private chat (the opening schedule still paces her).
+            if not budget.reserve(self.chat, proactive and not self.is_owner()):
                 return
             # One worker owns adapter activation. Do not accept a destination from Brain.
             if text:
