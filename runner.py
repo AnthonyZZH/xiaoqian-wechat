@@ -451,6 +451,32 @@ class Runner:
     def is_owner(self):
         return self.mode == "private" and self.chat == self.config.get("owner", "")
 
+    def owner_profile(self):
+        """Everything she has learned in the owner's chat, plus the library's notes about him."""
+        if not self.is_owner():
+            return ''
+        parts = []
+        for name, person in (getattr(self.memory, 'people', {}) or {}).items():
+            if not isinstance(person, dict):
+                continue
+            facts = '；'.join(str(f) for f in (person.get('facts') or [])[:30])
+            impression = person.get('impression') or ''
+            parts.append(f'{name}：{facts}' + (f'（你对他的印象：{impression}）' if impression else ''))
+        jokes = [f'{term}＝{(info or {}).get("meaning", "") if isinstance(info, dict) else info}'
+                 for term, info in list((getattr(self.memory, 'jargon', {}) or {}).items())[:40]]
+        if jokes:
+            parts.append('你们之间的梗和说法：' + '；'.join(jokes))
+        style = getattr(self.memory, 'style', '') or ''
+        if style:
+            parts.append('你们平时的聊天风格：' + style)
+        library = self.history_path.parent.parent / 'owner_profile.md'
+        try:
+            if library.is_file():
+                parts.append('图书馆里关于主人的记录：\n' + library.read_text(encoding='utf-8')[:3000])
+        except OSError:
+            pass
+        return '\n'.join(parts)[:6000]
+
     def take_relay(self):
         if self.relay_queue:
             return self.relay_queue.popleft()
@@ -669,7 +695,7 @@ class Runner:
             # Retrieval reads ONLY this runner's local Memory, selecting <=5 entries.
             facts = self.memory.social_retrieve(' '.join(m.text for m in pending)[-2000:]) if self.config['memory_enabled'] else []
             group_digest = self.context() if self.is_owner() else ''
-            result = self.brain.decide(self.history, proactive, chat=self.chat, mode=self.mode, memory=facts, mentioned=mentioned, opening=opening, group_digest=group_digest)
+            result = self.brain.decide(self.history, proactive, chat=self.chat, mode=self.mode, memory=facts, mentioned=mentioned, opening=opening, group_digest=group_digest, profile=self.owner_profile())
             self.proactive_used = True
             self.pending.clear()
             if not isinstance(result,dict) or not result.get('speak') or unsafe(result.get('text','')):
