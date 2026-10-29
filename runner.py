@@ -701,7 +701,7 @@ class Runner:
                 self.adapter.validate()
                 self.adapter.send(' '.join(str(notice).split()), cancel=cancel, max_chars=400)
             except Exception:
-                self.enabled.clear()
+                # Never go silent over one failed notice: log it and carry on.
                 self.emit('error', 'SOCIAL_OWNER_NOTICE_FAILED')
             return
         if self.is_owner() and not self.owner_asleep() and not self.pending and not self.tool_result_active and self.tool_results:
@@ -849,9 +849,9 @@ class Runner:
                     else:
                         self.owner_do(result['do'])
         except Exception:
+            # The pending messages were already taken off the queue, so nothing is resent;
+            # skip this round and keep going instead of pausing until someone notices.
             self.model_failed(None)
-            # Uncertain UI sends must not be retried. Owner can inspect then resume.
-            self.enabled.clear()
         finally:
             if self.opening_active:
                 self.opening_active = False

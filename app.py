@@ -385,8 +385,7 @@ class Bot:
             self.adapter.validate()
             self.adapter.send(receipt, cancel=cancel, max_chars=200)
         except Exception:
-            # An uncertain send is never retried. Keep a fixed diagnostic event only.
-            self.enabled.clear()
+            # An uncertain send is never retried, but one failure must not silence her.
             self.emit('error', 'SOCIAL_RELAY_FAILED')
             try:
                 title, private = self.adapter.current()
