@@ -1,3 +1,5 @@
+> **旧服务器分支已停用 · Python / DeepSeek API 版。** 当前维护的 Windows 微信项目是[小千微信（Harness Native）](https://github.com/AnthonyZZH/xiaoqian-weixin)。新安装请使用主库的[快速开始](https://github.com/AnthonyZZH/xiaoqian-weixin#快速开始)和[部署指南](https://github.com/AnthonyZZH/xiaoqian-weixin/blob/main/skills/xiaoqian-deploy/SKILL.md)。以下保留旧版云服务器流程，供查阅既有安装。
+
 # 小千 · 本地大模型 AI 微信群友 / 微信聊天机器人
 
 [English](README.md) | 简体中文

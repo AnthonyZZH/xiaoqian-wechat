@@ -1,3 +1,5 @@
+> **Retired server branch (Python / DeepSeek API).** The maintained Windows WeChat project is [Xiaoqian Weixin (Harness Native)](https://github.com/AnthonyZZH/xiaoqian-weixin). For a new installation, use its [quick start](https://github.com/AnthonyZZH/xiaoqian-weixin#快速开始) and [deployment guide](https://github.com/AnthonyZZH/xiaoqian-weixin/blob/main/skills/xiaoqian-deploy/SKILL.md). The instructions below describe the historical cloud-server edition.
+
 # Xiaoqian · Local-LLM AI WeChat Group Chat Bot
 
 English | [简体中文](README.zh-CN.md)
